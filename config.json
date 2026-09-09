@@ -1,0 +1,11 @@
+{
+  "proxy_port": 1080,
+  "admin_port": 8080,
+  "metrics_port": 9090,
+  "max_connections": 1000,
+  "auth_enabled": true,
+  "username": "kinetex",
+  "password": "securepassword",
+  "whitelist": [],
+  "blacklist": []
+}
