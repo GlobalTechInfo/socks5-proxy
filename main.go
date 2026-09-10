@@ -1277,8 +1277,8 @@ func (s *ProxyServer) startAdminServer(addr string) *http.Server {
 func (s *ProxyServer) startMetricsServer(addr string) *http.Server {
 	mux := http.NewServeMux()
 
-	// Prometheus endpoint (keep for backward compat)
-	mux.Handle("/metrics", promhttp.Handler())
+	// Prometheus endpoint
+	mux.Handle("/prometheus", promhttp.Handler())
 
 	// Live stats API for charts
 	mux.HandleFunc("/api/live", func(w http.ResponseWriter, r *http.Request) {
@@ -1349,9 +1349,9 @@ func (s *ProxyServer) startMetricsServer(addr string) *http.Server {
 		http.ServeFile(w, r, "web/chart.min.js")
 	})
 
-	// Serve the dashboard
+	// Serve the dashboard at / and /metrics
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/" {
+		if r.URL.Path != "/" && r.URL.Path != "/metrics" {
 			http.NotFound(w, r)
 			return
 		}
