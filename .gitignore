@@ -1,6 +1,7 @@
 # Binary
 socks5-proxy
 socks5-enterprise
+tunnel
 
 #Keep
 !data/.gitkeep

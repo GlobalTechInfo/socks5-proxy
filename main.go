@@ -20,6 +20,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/gorilla/websocket"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
@@ -1226,6 +1227,133 @@ func (s *ProxyServer) startAdminServer(addr string) *http.Server {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(Tiers)
+	})
+
+	// WebSocket-to-SOCKS5 bridge for tunneling through HTTP
+	var upgrader = websocket.Upgrader{
+		CheckOrigin: func(r *http.Request) bool { return true },
+	}
+	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+
+		// First message from client: target address (host:port)
+		_, target, err := conn.ReadMessage()
+		if err != nil {
+			return
+		}
+
+		// Connect to local SOCKS5 proxy
+		proxyAddr := fmt.Sprintf("127.0.0.1:%d", s.cfg.ProxyPort)
+		proxyConn, err := net.DialTimeout("tcp", proxyAddr, 5*time.Second)
+		if err != nil {
+			conn.WriteMessage(websocket.TextMessage, []byte("error: "+err.Error()))
+			return
+		}
+		defer proxyConn.Close()
+
+		// SOCKS5 handshake
+		authMethods := []byte{0x05, 0x01, 0x00} // no auth
+		if s.cfg.AuthEnabled {
+			authMethods = []byte{0x05, 0x01, 0x02} // username/password
+		}
+		if _, err := proxyConn.Write(authMethods); err != nil {
+			return
+		}
+		resp := make([]byte, 2)
+		if _, err := io.ReadFull(proxyConn, resp); err != nil || resp[1] == 0xFF {
+			return
+		}
+
+		// Auth if needed
+		if s.cfg.AuthEnabled {
+			userBytes := []byte(s.cfg.Username)
+			passBytes := []byte(s.cfg.Password)
+			authPacket := make([]byte, 3+len(userBytes)+len(passBytes))
+			authPacket[0] = 0x01
+			authPacket[1] = byte(len(userBytes))
+			copy(authPacket[2:2+len(userBytes)], userBytes)
+			authPacket[2+len(userBytes)] = byte(len(passBytes))
+			copy(authPacket[3+len(userBytes):], passBytes)
+			if _, err := proxyConn.Write(authPacket); err != nil {
+				return
+			}
+			authResp := make([]byte, 2)
+			if _, err := io.ReadFull(proxyConn, authResp); err != nil || authResp[1] != 0x00 {
+				return
+			}
+		}
+
+		// SOCKS5 CONNECT request - parse target
+		host, portStr, err := net.SplitHostPort(string(target))
+		if err != nil {
+			return
+		}
+		port, _ := strconv.Atoi(portStr)
+
+		// Build CONNECT request
+		var connectReq []byte
+		connectReq = append(connectReq, 0x05, 0x01, 0x00) // VER, CMD=CONNECT, RSV
+
+		ip := net.ParseIP(host)
+		if ip4 := ip.To4(); ip4 != nil {
+			connectReq = append(connectReq, 0x01) // IPv4
+			connectReq = append(connectReq, ip4...)
+		} else if ip6 := ip.To16(); ip6 != nil {
+			connectReq = append(connectReq, 0x04) // IPv6
+			connectReq = append(connectReq, ip6...)
+		} else {
+			connectReq = append(connectReq, 0x03) // Domain
+			connectReq = append(connectReq, byte(len(host)))
+			connectReq = append(connectReq, []byte(host)...)
+		}
+		connectReq = append(connectReq, byte(port>>8), byte(port&0xFF))
+
+		if _, err := proxyConn.Write(connectReq); err != nil {
+			return
+		}
+
+		// Read CONNECT response
+		connectResp := make([]byte, 10)
+		if _, err := io.ReadFull(proxyConn, connectResp); err != nil {
+			return
+		}
+		if connectResp[1] != 0x00 {
+			return
+		}
+
+		// Bridge: WebSocket <-> SOCKS5 proxy
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			buf := make([]byte, 32*1024)
+			for {
+				n, err := proxyConn.Read(buf)
+				if n > 0 {
+					conn.WriteMessage(websocket.BinaryMessage, buf[:n])
+				}
+				if err != nil {
+					return
+				}
+			}
+		}()
+		go func() {
+			defer conn.Close()
+			for {
+				_, msg, err := conn.ReadMessage()
+				if err != nil {
+					proxyConn.Close()
+					return
+				}
+				if _, err := proxyConn.Write(msg); err != nil {
+					return
+				}
+			}
+		}()
+		<-done
 	})
 
 	mux.HandleFunc("/chart.min.js", func(w http.ResponseWriter, r *http.Request) {
