@@ -1,0 +1,9 @@
+.git
+.github
+.env
+README.md
+docker-compose*
+*.md
+LICENSE
+.vscode
+.idea

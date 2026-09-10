@@ -1,5 +1,9 @@
 # Binary
 socks5-proxy
+socks5-enterprise
+
+#Keep
+!data/.gitkeep
 
 # Go build artifacts
 *.exe
@@ -9,6 +13,9 @@ socks5-proxy
 *.dylib
 *.test
 *.out
+#DB
+*.db
+*.db-*
 
 # IDE
 .idea/

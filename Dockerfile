@@ -1,5 +1,5 @@
 # Stage 1: Build the Go application
-FROM golang:1.21-alpine AS builder
+FROM golang:1.24-alpine AS builder
 
 WORKDIR /app
 
@@ -24,8 +24,11 @@ COPY --from=builder /app/socks5-proxy .
 COPY config.json .
 COPY web ./web
 
+# Create data directory for SQLite persistence
+RUN mkdir -p /app/data
+
 # Create a non-root user
-RUN addgroup -S appgroup && adduser -S appuser -G appgroup
+RUN addgroup -S appgroup && adduser -S appuser -G appgroup && chown -R appuser:appgroup /app
 USER appuser
 
 # Expose ports

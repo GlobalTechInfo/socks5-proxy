@@ -1,91 +1,434 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-    <title>SOCKS5 Proxy Dashboard</title>
-    <style>
-        body { font-family: Arial; margin: 40px; background: #f5f5f5; }
-        .container { max-width: 1200px; margin: 0 auto; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
-        h1 { color: #333; }
-        .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 20px; margin: 20px 0; }
-        .stat-card { background: #f8f9fa; padding: 15px; border-radius: 6px; border-left: 4px solid #007bff; }
-        .stat-card h3 { margin-top: 0; color: #666; }
-        .stat-card p { font-size: 24px; font-weight: bold; color: #333; }
-        table { width: 100%; border-collapse: collapse; margin-top: 20px; }
-        th, td { padding: 12px; text-align: left; border-bottom: 1px solid #ddd; }
-        th { background: #f8f9fa; }
-        tr:hover { background: #f1f1f1; }
-    </style>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SOCKS5 Proxy Admin</title>
+<script src="/chart.min.js"></script>
+<style>
+  *{margin:0;padding:0;box-sizing:border-box}
+  body{background:#0a0a0f;color:#e0e0e0;font-family:'Courier New',monospace;overflow-x:hidden}
+  .header{padding:20px;text-align:center;border-bottom:1px solid #1e1e3a}
+  .header h1{font-size:14px;letter-spacing:8px;text-transform:uppercase;background:linear-gradient(135deg,#00f0ff,#7b2dff);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+  .header .pulse{display:inline-block;width:8px;height:8px;background:#00f0ff;border-radius:50%;margin-right:10px;animation:pulse 2s infinite}
+  @keyframes pulse{0%,100%{opacity:1;box-shadow:0 0 10px #00f0ff}50%{opacity:0.5;box-shadow:0 0 5px #00f0ff}}
+  .grid{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;padding:20px;max-width:1600px;margin:0 auto}
+  .card{background:linear-gradient(145deg,#12121a,#1a1a2e);border:1px solid #1e1e3a;border-radius:12px;padding:20px;position:relative;overflow:hidden}
+  .card::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;background:linear-gradient(90deg,transparent,#00f0ff,transparent)}
+  .card h3{font-size:11px;text-transform:uppercase;letter-spacing:2px;color:#555;margin-bottom:8px}
+  .card .value{font-size:32px;font-weight:bold;background:linear-gradient(135deg,#00f0ff,#7b2dff);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+  .card .sub{font-size:11px;color:#444;margin-top:4px}
+  .charts{display:grid;grid-template-columns:1fr 1fr;gap:16px;padding:0 20px 20px;max-width:1600px;margin:0 auto}
+  .chart-box{background:linear-gradient(145deg,#12121a,#1a1a2e);border:1px solid #1e1e3a;border-radius:12px;padding:20px;position:relative;overflow:hidden;min-height:280px}
+  .chart-box::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;background:linear-gradient(90deg,transparent,#7b2dff,transparent)}
+  .chart-box h2{font-size:12px;text-transform:uppercase;letter-spacing:3px;color:#555;margin-bottom:15px}
+  .chart-box canvas{position:relative;width:100%!important;height:220px!important}
+  .full-width{grid-column:1/-1}
+  .bar-chart{display:flex;align-items:flex-end;gap:4px;height:220px;padding-top:10px}
+  .bar{flex:1;background:linear-gradient(180deg,#00f0ff,#7b2dff);border-radius:4px 4px 0 0;min-width:20px;position:relative;transition:height 0.5s ease;cursor:pointer}
+  .bar:hover{opacity:0.8}
+  .bar .label{position:absolute;bottom:-20px;left:50%;transform:translateX(-50%);font-size:8px;color:#555;white-space:nowrap;max-width:60px;overflow:hidden;text-overflow:ellipsis}
+  .bar .tip{position:absolute;top:-25px;left:50%;transform:translateX(-50%);background:#1e1e3a;color:#00f0ff;padding:2px 6px;border-radius:4px;font-size:10px;white-space:nowrap;opacity:0;transition:opacity 0.2s}
+  .bar:hover .tip{opacity:1}
+  .timeline{display:flex;gap:1px;height:60px;align-items:flex-end}
+  .tick{flex:1;background:#00f0ff;border-radius:1px;min-height:2px;transition:height 0.3s;opacity:0.7}
+  .section{padding:0 20px 20px;max-width:1600px;margin:0 auto}
+  .section h2{font-size:12px;text-transform:uppercase;letter-spacing:3px;color:#555;margin-bottom:15px;padding-top:10px}
+  table{width:100%;border-collapse:collapse}
+  th,td{padding:12px 10px;text-align:left;border-bottom:1px solid #1e1e3a;font-size:13px}
+  th{color:#555;font-size:11px;text-transform:uppercase;letter-spacing:1px}
+  tr:hover{background:rgba(0,240,255,0.03)}
+  .badge{padding:3px 8px;border-radius:4px;font-size:11px;color:white;text-transform:uppercase;letter-spacing:1px}
+  .badge-free{background:#6c757d}
+  .badge-basic{background:#17a2b8}
+  .badge-pro{background:#ffc107;color:#333}
+  .badge-unlimited{background:#28a745}
+  .badge-active{background:#28a745}
+  .badge-disabled{background:#dc3545}
+  .actions{display:flex;gap:5px;flex-wrap:wrap}
+  .form-box{background:linear-gradient(145deg,#12121a,#1a1a2e);border:1px solid #1e1e3a;border-radius:12px;padding:20px;position:relative;overflow:hidden}
+  .form-box::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;background:linear-gradient(90deg,transparent,#00f0ff,transparent)}
+  .form-grid{display:grid;grid-template-columns:1fr 1fr;gap:15px}
+  .field{display:flex;flex-direction:column}
+  .field label{font-size:11px;text-transform:uppercase;letter-spacing:1px;color:#555;margin-bottom:6px}
+  .field input,.field select{background:#0a0a0f;border:1px solid #1e1e3a;color:#e0e0e0;padding:10px;border-radius:6px;font-size:13px;font-family:'Courier New',monospace;outline:none;transition:border-color 0.2s}
+  .field input:focus,.field select:focus{border-color:#00f0ff}
+  .btn{padding:10px 20px;border:none;border-radius:6px;cursor:pointer;font-size:12px;text-transform:uppercase;letter-spacing:1px;font-family:'Courier New',monospace;transition:all 0.2s;margin-top:15px}
+  .btn-primary{background:linear-gradient(135deg,#00f0ff,#7b2dff);color:#0a0a0f;font-weight:bold}
+  .btn-primary:hover{opacity:0.85;box-shadow:0 0 15px rgba(0,240,255,0.3)}
+  .btn-danger{background:#dc3545;color:white}
+  .btn-danger:hover{background:#c82333}
+  .btn-success{background:#28a745;color:white}
+  .btn-success:hover{background:#218838}
+  .btn-sm{padding:5px 10px;font-size:11px;margin:2px}
+  .msg{padding:10px;border-radius:6px;margin-top:10px;display:none;font-size:12px}
+  .msg-ok{background:rgba(40,167,69,0.15);color:#28a745;border:1px solid rgba(40,167,69,0.3)}
+  .msg-err{background:rgba(220,53,69,0.15);color:#dc3545;border:1px solid rgba(220,53,69,0.3)}
+  @media(max-width:900px){.grid{grid-template-columns:1fr 1fr}.charts{grid-template-columns:1fr}.form-grid{grid-template-columns:1fr}}
+  @media(max-width:500px){.grid{grid-template-columns:1fr}}
+</style>
 </head>
 <body>
-    <div class="container">
-        <h1>🚀 Enterprise SOCKS5 Proxy Dashboard</h1>
+<div class="header">
+  <h1><span class="pulse"></span>SOCKS5 Proxy Admin</h1>
+</div>
 
-        <div class="stats">
-            <div class="stat-card">
-                <h3>Active Connections</h3>
-                <p id="active-conns">0</p>
-            </div>
-            <div class="stat-card">
-                <h3>Total Connections</h3>
-                <p id="total-conns">0</p>
-            </div>
-            <div class="stat-card">
-                <h3>Uptime</h3>
-                <p id="uptime">0s</p>
-            </div>
-            <div class="stat-card">
-                <h3>Blocked IPs</h3>
-                <p id="blocked-ips">0</p>
-            </div>
-        </div>
+<div class="grid">
+  <div class="card"><h3>Active Connections</h3><div class="value" id="v-active">0</div><div class="sub">current</div></div>
+  <div class="card"><h3>Total Connections</h3><div class="value" id="v-total">0</div><div class="sub">all time</div></div>
+  <div class="card"><h3>Uptime</h3><div class="value" id="v-uptime" style="font-size:22px">0s</div><div class="sub">since start</div></div>
+  <div class="card"><h3>Blocked IPs</h3><div class="value" id="v-blocked">0</div><div class="sub">rejected</div></div>
+</div>
 
-        <h2>📊 Connection Statistics</h2>
-        <table>
-            <thead>
-                <tr>
-                    <th>Target</th>
-                    <th>Connections</th>
-                </tr>
-            </thead>
-            <tbody id="connections-body">
-                <tr><td colspan="2">Loading...</td></tr>
-            </tbody>
-        </table>
+<div class="grid">
+  <div class="card" style="grid-column:1/-1"><h3>Connection Activity (last 60s)</h3>
+    <div class="timeline" id="timeline"></div>
+  </div>
+</div>
 
-        <h2>🔒 Configuration</h2>
-        <pre id="config">Loading...</pre>
+<div class="charts">
+  <div class="chart-box"><h2>Connections Over Time</h2><canvas id="chart-connections"></canvas></div>
+  <div class="chart-box"><h2>Top Destinations</h2><canvas id="chart-destinations"></canvas></div>
+  <div class="chart-box"><h2>Auth Failures</h2><canvas id="chart-auth"></canvas></div>
+  <div class="chart-box"><h2>Blocked Connections</h2><canvas id="chart-blocked"></canvas></div>
+</div>
+
+<div class="charts">
+  <div class="chart-box full-width"><h2>Destination Heatmap</h2>
+    <div class="bar-chart" id="heatmap"></div>
+  </div>
+</div>
+
+<div class="section">
+  <h2>User Management</h2>
+  <div class="form-box">
+    <div id="user-msg" class="msg"></div>
+    <div class="form-grid">
+      <div class="field">
+        <label for="u-username">Username</label>
+        <input type="text" id="u-username" placeholder="e.g. john">
+      </div>
+      <div class="field">
+        <label for="u-password">Password (auto-generated if empty)</label>
+        <input type="text" id="u-password" placeholder="auto-generated if empty">
+      </div>
+      <div class="field">
+        <label for="u-tier">Tier</label>
+        <select id="u-tier">
+          <option value="free">Free (1 conn / 1Mbps / 1GB / 7d)</option>
+          <option value="basic">Basic (5 conns / 5Mbps / 50GB / 30d)</option>
+          <option value="pro">Pro (20 conns / 50Mbps / unlimited / 90d)</option>
+          <option value="unlimited">Unlimited</option>
+        </select>
+      </div>
     </div>
+    <button class="btn btn-primary" onclick="createUser()">Add User</button>
+  </div>
 
-    <script>
-        async function loadStats() {
-            try {
-                const response = await fetch('/api/stats');
-                const stats = await response.json();
+  <table style="margin-top:16px">
+    <thead>
+      <tr>
+        <th>ID</th>
+        <th>Username</th>
+        <th>Tier</th>
+        <th>Conns</th>
+        <th>Data Used</th>
+        <th>Expiry</th>
+        <th>Status</th>
+        <th>Actions</th>
+      </tr>
+    </thead>
+    <tbody id="users-body">
+      <tr><td colspan="8" style="color:#555">Loading...</td></tr>
+    </tbody>
+  </table>
+</div>
 
-                document.getElementById('active-conns').textContent = stats.active_connections || 0;
-                document.getElementById('total-conns').textContent = stats.total_connections || 0;
-                document.getElementById('uptime').textContent = stats.uptime || '0s';
-                document.getElementById('blocked-ips').textContent = Object.keys(stats.blocked_ips || {}).length;
+<div class="section">
+  <h2>Settings</h2>
+  <div class="form-box">
+    <div id="settings-msg" class="msg"></div>
+    <div class="form-grid">
+      <div class="field">
+        <label for="s-maxconns">Max Connections</label>
+        <input type="number" id="s-maxconns" min="1" value="1000">
+      </div>
+      <div class="field">
+        <label for="s-proxyuser">Proxy User</label>
+        <input type="text" id="s-proxyuser" value="">
+      </div>
+      <div class="field">
+        <label for="s-proxypass">Proxy Password</label>
+        <input type="password" id="s-proxypass" placeholder="****">
+      </div>
+      <div class="field">
+        <label for="s-authenabled">SOCKS5 Auth</label>
+        <select id="s-authenabled">
+          <option value="true">Enabled</option>
+          <option value="false">Disabled</option>
+        </select>
+      </div>
+      <div class="field">
+        <label for="s-adminauth">Admin Auth</label>
+        <select id="s-adminauth">
+          <option value="true">Enabled</option>
+          <option value="false">Disabled</option>
+        </select>
+      </div>
+      <div class="field">
+        <label for="s-secheaders">Security Headers</label>
+        <select id="s-secheaders">
+          <option value="true">Enabled</option>
+          <option value="false">Disabled</option>
+        </select>
+      </div>
+      <div class="field">
+        <label for="s-ratelimit">Rate Limiting</label>
+        <select id="s-ratelimit">
+          <option value="true">Enabled</option>
+          <option value="false">Disabled</option>
+        </select>
+      </div>
+      <div class="field">
+        <label for="s-rps">Rate Limit RPS</label>
+        <input type="number" id="s-rps" min="1" value="30">
+      </div>
+    </div>
+    <button class="btn btn-primary" onclick="saveConfig()">Save Settings</button>
+  </div>
+</div>
 
-                const connectionsBody = document.getElementById('connections-body');
-                connectionsBody.innerHTML = '';
+<script>
+var timelineData=[];
+for(var i=0;i<60;i++)timelineData.push(0);
 
-                if (stats.connections) {
-                    for (const [target, count] of Object.entries(stats.connections)) {
-                        const row = document.createElement('tr');
-                        row.innerHTML = `<td>${target}</td><td>${count}</td>`;
-                        connectionsBody.appendChild(row);
-                    }
-                }
+var chartOpts={responsive:true,maintainAspectRatio:false,animation:{duration:300},plugins:{legend:{display:false}},scales:{x:{display:false},y:{beginAtZero:true,grid:{color:'#1e1e3a'},ticks:{color:'#444',font:{family:'Courier New',size:10}}}}};
 
-                document.getElementById('config').textContent = JSON.stringify(stats, null, 2);
-            } catch (error) {
-                console.error('Error loading stats:', error);
-            }
-        }
+var ctxConn=document.getElementById('chart-connections').getContext('2d');
+var chartConn=new Chart(ctxConn,{type:'line',data:{labels:[],datasets:[{label:'Active',data:[],borderColor:'#00f0ff',backgroundColor:'rgba(0,240,255,0.1)',fill:true,tension:0.4,pointRadius:0,borderWidth:2},{label:'Total',data:[],borderColor:'#7b2dff',backgroundColor:'rgba(123,45,255,0.1)',fill:true,tension:0.4,pointRadius:0,borderWidth:2}]},options:{...chartOpts,plugins:{legend:{display:true,labels:{color:'#555',font:{family:'Courier New',size:10}}}}}});
 
-        loadStats();
-        setInterval(loadStats, 1000);
-    </script>
+var ctxDest=document.getElementById('chart-destinations').getContext('2d');
+var chartDest=new Chart(ctxDest,{type:'doughnut',data:{labels:[],datasets:[{data:[],backgroundColor:['#00f0ff','#7b2dff','#ff006e','#ffbe0b','#00f5d4','#fee440','#f15bb5','#9b5de5']}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{position:'right',labels:{color:'#555',font:{family:'Courier New',size:10},boxWidth:12,padding:8}}}}});
+
+var ctxAuth=document.getElementById('chart-auth').getContext('2d');
+var chartAuth=new Chart(ctxAuth,{type:'bar',data:{labels:[],datasets:[{data:[],backgroundColor:'rgba(255,0,110,0.6)',borderColor:'#ff006e',borderWidth:1,borderRadius:4}]},options:chartOpts});
+
+var ctxBlocked=document.getElementById('chart-blocked').getContext('2d');
+var chartBlocked=new Chart(ctxBlocked,{type:'bar',data:{labels:[],datasets:[{data:[],backgroundColor:'rgba(255,190,11,0.6)',borderColor:'#ffbe0b',borderWidth:1,borderRadius:4}]},options:chartOpts});
+
+function renderTimeline(){
+  var el=document.getElementById('timeline');
+  el.innerHTML='';
+  var max=Math.max.apply(null,timelineData)||1;
+  for(var i=0;i<timelineData.length;i++){
+    var d=document.createElement('div');
+    d.className='tick';
+    d.style.height=Math.max(2,(timelineData[i]/max)*100)+'%';
+    el.appendChild(d);
+  }
+}
+
+function renderHeatmap(data){
+  var el=document.getElementById('heatmap');
+  el.innerHTML='';
+  if(!data)return;
+  var entries=Object.entries(data).sort(function(a,b){return b[1]-a[1]}).slice(0,20);
+  if(entries.length===0)return;
+  var max=entries[0][1]||1;
+  for(var i=0;i<entries.length;i++){
+    var h=Math.max(10,(entries[i][1]/max)*100);
+    var bar=document.createElement('div');
+    bar.className='bar';
+    bar.style.height=h+'%';
+    bar.innerHTML='<div class="tip">'+entries[i][0]+': '+entries[i][1]+'</div><div class="label">'+entries[i][0]+'</div>';
+    el.appendChild(bar);
+  }
+}
+
+function updateCharts(history){
+  if(!history||history.length===0)return;
+  var labels=[];var active=[];var total=[];
+  for(var i=history.length-1;i>=0;i--){
+    var t=new Date(history[i].recorded_at);
+    labels.push(t.getHours()+':'+String(t.getMinutes()).padStart(2,'0'));
+    active.push(history[i].active_connections);
+    total.push(history[i].total_connections);
+  }
+  chartConn.data.labels=labels;
+  chartConn.data.datasets[0].data=active;
+  chartConn.data.datasets[1].data=total;
+  chartConn.update('none');
+
+  var authLabels=[];var authData=[];
+  var blLabels=[];var blData=[];
+  for(var i=Math.max(0,history.length-20);i<history.length;i++){
+    var t=new Date(history[i].recorded_at);
+    var l=t.getHours()+':'+String(t.getMinutes()).padStart(2,'0');
+    authLabels.push(l);authData.push(history[i].auth_failures);
+    blLabels.push(l);blData.push(history[i].blocked_connections);
+  }
+  chartAuth.data.labels=authLabels;
+  chartAuth.data.datasets[0].data=authData;
+  chartAuth.update('none');
+  chartBlocked.data.labels=blLabels;
+  chartBlocked.data.datasets[0].data=blData;
+  chartBlocked.update('none');
+}
+
+function animateValue(el,end){
+  var start=parseInt(el.textContent)||0;
+  if(start===end)return;
+  var diff=end-start;
+  var steps=20;
+  var step=0;
+  var timer=setInterval(function(){
+    step++;
+    el.textContent=Math.round(start+diff*(step/steps));
+    if(step>=steps)clearInterval(timer);
+  },15);
+}
+
+function formatBytes(bytes){
+  if(bytes<0)return'unlimited';
+  if(bytes===0)return'0 B';
+  var units=['B','KB','MB','GB','TB'];
+  var i=Math.floor(Math.log(bytes)/Math.log(1024));
+  return(bytes/Math.pow(1024,i)).toFixed(1)+' '+units[i];
+}
+
+function tierBadge(tier){return'<span class="badge badge-'+tier+'">'+tier+'</span>'}
+function statusBadge(enabled){return'<span class="badge '+(enabled?'badge-active':'badge-disabled')+'">'+(enabled?'active':'disabled')+'</span>'}
+
+async function poll(){
+  try{
+    var r=await fetch('/api/stats',{credentials:'same-origin'});
+    var d=await r.json();
+    animateValue(document.getElementById('v-active'),d.active_connections||0);
+    animateValue(document.getElementById('v-total'),d.total_connections||0);
+    animateValue(document.getElementById('v-blocked'),d.blocked_connections||0);
+    document.getElementById('v-uptime').textContent=d.uptime||'0s';
+    timelineData.push(d.active_connections||0);
+    if(timelineData.length>60)timelineData.shift();
+    renderTimeline();
+    if(d.top_destinations){
+      var destEntries=Object.entries(d.top_destinations).slice(0,8);
+      chartDest.data.labels=destEntries.map(function(e){return e[0]});
+      chartDest.data.datasets[0].data=destEntries.map(function(e){return e[1]});
+      chartDest.update('none');
+    }
+  }catch(e){}
+}
+
+async function pollHistory(){
+  try{
+    var r=await fetch('/api/history/stats?n=120',{credentials:'same-origin'});
+    var d=await r.json();
+    updateCharts(d);
+  }catch(e){}
+  try{
+    var r=await fetch('/api/history/top-alltime',{credentials:'same-origin'});
+    var d=await r.json();
+    renderHeatmap(d);
+  }catch(e){}
+}
+
+async function loadUsers(){
+  try{
+    var r=await fetch('/api/users',{credentials:'same-origin'});
+    var users=await r.json();
+    var tbody=document.getElementById('users-body');
+    tbody.innerHTML='';
+    if(!users||users.length===0){
+      tbody.innerHTML='<tr><td colspan="8" style="color:#555">No users found. Create one above.</td></tr>';
+      return;
+    }
+    for(var i=0;i<users.length;i++){
+      var u=users[i];
+      var maxConn=u.max_connections<0?'unlimited':u.max_connections;
+      var dataUsed=formatBytes(u.data_used_bytes);
+      var expiry=u.expiry||'never';
+      var row=document.createElement('tr');
+      row.innerHTML='<td>'+u.id+'</td>'+
+        '<td>'+u.username+'</td>'+
+        '<td>'+tierBadge(u.tier)+'</td>'+
+        '<td>'+u.active_connections+' / '+maxConn+'</td>'+
+        '<td>'+dataUsed+'</td>'+
+        '<td>'+expiry+'</td>'+
+        '<td>'+statusBadge(u.enabled)+'</td>'+
+        '<td class="actions">'+
+        '<button class="btn btn-sm btn-success" onclick="resetUser('+u.id+')">Reset</button>'+
+        '<button class="btn btn-sm '+(u.enabled?'btn-danger':'btn-success')+'" onclick="toggleUser('+u.id+','+!u.enabled+')">'+(u.enabled?'Disable':'Enable')+'</button>'+
+        '<button class="btn btn-sm btn-danger" onclick="deleteUser('+u.id+',\''+u.username+'\')">Del</button>'+
+        '</td>';
+      tbody.appendChild(row);
+    }
+  }catch(e){}
+}
+
+async function createUser(){
+  var msg=document.getElementById('user-msg');
+  var body={username:document.getElementById('u-username').value,password:document.getElementById('u-password').value,tier:document.getElementById('u-tier').value};
+  if(!body.username){msg.textContent='Username is required';msg.className='msg msg-err';msg.style.display='block';return}
+  try{
+    var r=await fetch('/api/users',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    var data=await r.json();
+    if(r.ok){
+      var info=data.password?' | Password: '+data.password:'';
+      msg.textContent='User created'+info;msg.className='msg msg-ok';msg.style.display='block';
+      document.getElementById('u-username').value='';document.getElementById('u-password').value='';
+      loadUsers();
+    }else{msg.textContent='Error: '+(data.error||'unknown');msg.className='msg msg-err';msg.style.display='block'}
+  }catch(e){msg.textContent='Network error: '+e.message;msg.className='msg msg-err';msg.style.display='block'}
+}
+
+async function deleteUser(id,name){
+  if(!confirm('Delete user "'+name+'"?'))return;
+  try{await fetch('/api/users/'+id,{method:'DELETE',credentials:'same-origin'});loadUsers()}catch(e){}
+}
+
+async function toggleUser(id,enabled){
+  try{await fetch('/api/users/'+id,{method:'PUT',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:enabled})});loadUsers()}catch(e){}
+}
+
+async function resetUser(id){
+  if(!confirm('Reset data usage for this user?'))return;
+  try{await fetch('/api/users/'+id+'/reset',{method:'POST',credentials:'same-origin'});loadUsers()}catch(e){}
+}
+
+async function loadConfig(){
+  try{
+    var r=await fetch('/api/config',{credentials:'same-origin'});
+    var cfg=await r.json();
+    document.getElementById('s-maxconns').value=cfg.max_connections||1000;
+    document.getElementById('s-proxyuser').value=cfg.proxy_user||'';
+    document.getElementById('s-authenabled').value=cfg.auth_enabled?'true':'false';
+    document.getElementById('s-adminauth').value=cfg.admin_auth_enabled?'true':'false';
+    document.getElementById('s-secheaders').value=cfg.security_headers_enabled?'true':'false';
+    document.getElementById('s-ratelimit').value=cfg.rate_limit_enabled?'true':'false';
+    document.getElementById('s-rps').value=cfg.rate_limit_rps||30;
+  }catch(e){}
+}
+
+async function saveConfig(){
+  var msg=document.getElementById('settings-msg');
+  var pass=document.getElementById('s-proxypass').value;
+  var body={max_connections:parseInt(document.getElementById('s-maxconns').value)||1000,proxy_user:document.getElementById('s-proxyuser').value,auth_enabled:document.getElementById('s-authenabled').value==='true',admin_auth_enabled:document.getElementById('s-adminauth').value==='true',security_headers_enabled:document.getElementById('s-secheaders').value==='true',rate_limit_enabled:document.getElementById('s-ratelimit').value==='true',rate_limit_rps:parseInt(document.getElementById('s-rps').value)||30};
+  if(pass&&pass!=='****')body.proxy_pass=pass;
+  try{
+    var r=await fetch('/api/config',{method:'PUT',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    if(r.ok){msg.textContent='Settings saved.';msg.className='msg msg-ok';msg.style.display='block';document.getElementById('s-proxypass').value='';loadConfig()}
+    else{var err=await r.text();msg.textContent='Error: '+err;msg.className='msg msg-err';msg.style.display='block'}
+  }catch(e){msg.textContent='Network error: '+e.message;msg.className='msg msg-err';msg.style.display='block'}
+}
+
+renderTimeline();
+poll();
+pollHistory();
+loadUsers();
+loadConfig();
+setInterval(poll,2000);
+setInterval(pollHistory,10000);
+setInterval(loadUsers,10000);
+</script>
 </body>
 </html>

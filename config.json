@@ -4,8 +4,14 @@
   "metrics_port": 9090,
   "max_connections": 1000,
   "auth_enabled": true,
-  "username": "kinetex",
-  "password": "securepassword",
+  "username": "changeme",
+  "password": "changeme",
   "whitelist": [],
-  "blacklist": []
+  "blacklist": [],
+  "admin_auth_enabled": true,
+  "admin_username": "admin",
+  "admin_password": "changeme",
+  "security_headers_enabled": true,
+  "rate_limit_enabled": true,
+  "rate_limit_rps": 30
 }
