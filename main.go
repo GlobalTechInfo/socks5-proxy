@@ -765,7 +765,7 @@ func securityHeaders(next http.Handler) http.Handler {
 func basicAuth(user, pass string) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if r.URL.Path == "/health" || r.URL.Path == "/ws" || r.URL.Path == "/tunnel" {
+			if r.URL.Path == "/health" {
 				next.ServeHTTP(w, r)
 				return
 			}
@@ -1226,122 +1226,6 @@ func (s *ProxyServer) startAdminServer(addr string) *http.Server {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(Tiers)
-	})
-
-	// HTTP tunnel: hijack connection and bridge to SOCKS5 proxy
-	// Client sends POST /tunnel with target in X-Target header
-	mux.HandleFunc("/tunnel", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		target := r.Header.Get("X-Target")
-		if target == "" {
-			http.Error(w, "X-Target header required", http.StatusBadRequest)
-			return
-		}
-
-		hijacker, ok := w.(http.Hijacker)
-		if !ok {
-			http.Error(w, "hijack not supported", http.StatusInternalServerError)
-			return
-		}
-
-		// Write minimal HTTP response before hijacking
-		w.Header().Set("Content-Length", "0")
-		w.WriteHeader(http.StatusOK)
-		if f, ok := w.(http.Flusher); ok {
-			f.Flush()
-		}
-
-		clientConn, _, err := hijacker.Hijack()
-		if err != nil {
-			return
-		}
-		defer clientConn.Close()
-
-		// Connect to local SOCKS5 proxy
-		proxyAddr := fmt.Sprintf("127.0.0.1:%d", s.cfg.ProxyPort)
-		proxyConn, err := net.DialTimeout("tcp", proxyAddr, 5*time.Second)
-		if err != nil {
-			return
-		}
-		defer proxyConn.Close()
-
-		// SOCKS5 handshake
-		authMethods := []byte{0x05, 0x01, 0x00}
-		if s.cfg.AuthEnabled {
-			authMethods = []byte{0x05, 0x01, 0x02}
-		}
-		if _, err := proxyConn.Write(authMethods); err != nil {
-			return
-		}
-		resp := make([]byte, 2)
-		if _, err := io.ReadFull(proxyConn, resp); err != nil || resp[1] == 0xFF {
-			return
-		}
-
-		if s.cfg.AuthEnabled {
-			userBytes := []byte(s.cfg.Username)
-			passBytes := []byte(s.cfg.Password)
-			authPacket := make([]byte, 3+len(userBytes)+len(passBytes))
-			authPacket[0] = 0x01
-			authPacket[1] = byte(len(userBytes))
-			copy(authPacket[2:2+len(userBytes)], userBytes)
-			authPacket[2+len(userBytes)] = byte(len(passBytes))
-			copy(authPacket[3+len(userBytes):], passBytes)
-			if _, err := proxyConn.Write(authPacket); err != nil {
-				return
-			}
-			authResp := make([]byte, 2)
-			if _, err := io.ReadFull(proxyConn, authResp); err != nil || authResp[1] != 0x00 {
-				return
-			}
-		}
-
-		host, portStr, err := net.SplitHostPort(target)
-		if err != nil {
-			return
-		}
-		port, _ := strconv.Atoi(portStr)
-
-		var connectReq []byte
-		connectReq = append(connectReq, 0x05, 0x01, 0x00)
-
-		ip := net.ParseIP(host)
-		if ip4 := ip.To4(); ip4 != nil {
-			connectReq = append(connectReq, 0x01)
-			connectReq = append(connectReq, ip4...)
-		} else if ip6 := ip.To16(); ip6 != nil {
-			connectReq = append(connectReq, 0x04)
-			connectReq = append(connectReq, ip6...)
-		} else {
-			connectReq = append(connectReq, 0x03)
-			connectReq = append(connectReq, byte(len(host)))
-			connectReq = append(connectReq, []byte(host)...)
-		}
-		connectReq = append(connectReq, byte(port>>8), byte(port&0xFF))
-
-		if _, err := proxyConn.Write(connectReq); err != nil {
-			return
-		}
-
-		connectResp := make([]byte, 10)
-		if _, err := io.ReadFull(proxyConn, connectResp); err != nil {
-			return
-		}
-		if connectResp[1] != 0x00 {
-			return
-		}
-
-		// Bridge: raw TCP client <-> SOCKS5 proxy
-		done := make(chan struct{})
-		go func() {
-			defer close(done)
-			io.Copy(proxyConn, clientConn)
-		}()
-		io.Copy(clientConn, proxyConn)
-		<-done
 	})
 
 	mux.HandleFunc("/chart.min.js", func(w http.ResponseWriter, r *http.Request) {
