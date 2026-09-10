@@ -20,6 +20,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/gorilla/websocket"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
@@ -765,7 +766,7 @@ func securityHeaders(next http.Handler) http.Handler {
 func basicAuth(user, pass string) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if r.URL.Path == "/health" || r.URL.Path == "/ws" || r.URL.Path == "/tunnel" {
+			if r.URL.Path == "/health" {
 				next.ServeHTTP(w, r)
 				return
 			}
@@ -1228,50 +1229,36 @@ func (s *ProxyServer) startAdminServer(addr string) *http.Server {
 		json.NewEncoder(w).Encode(Tiers)
 	})
 
-	// HTTP tunnel: hijack connection and bridge to SOCKS5 proxy
-	// Client sends POST /tunnel with target in X-Target header
-	mux.HandleFunc("/tunnel", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		target := r.Header.Get("X-Target")
-		if target == "" {
-			http.Error(w, "X-Target header required", http.StatusBadRequest)
-			return
-		}
-
-		hijacker, ok := w.(http.Hijacker)
-		if !ok {
-			http.Error(w, "hijack not supported", http.StatusInternalServerError)
-			return
-		}
-
-		// Write minimal HTTP response before hijacking
-		w.Header().Set("Content-Length", "0")
-		w.WriteHeader(http.StatusOK)
-		if f, ok := w.(http.Flusher); ok {
-			f.Flush()
-		}
-
-		clientConn, _, err := hijacker.Hijack()
+	// WebSocket-to-SOCKS5 bridge for tunneling through HTTP
+	var upgrader = websocket.Upgrader{
+		CheckOrigin: func(r *http.Request) bool { return true },
+	}
+	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
 			return
 		}
-		defer clientConn.Close()
+		defer conn.Close()
+
+		// First message from client: target address (host:port)
+		_, target, err := conn.ReadMessage()
+		if err != nil {
+			return
+		}
 
 		// Connect to local SOCKS5 proxy
 		proxyAddr := fmt.Sprintf("127.0.0.1:%d", s.cfg.ProxyPort)
 		proxyConn, err := net.DialTimeout("tcp", proxyAddr, 5*time.Second)
 		if err != nil {
+			conn.WriteMessage(websocket.TextMessage, []byte("error: "+err.Error()))
 			return
 		}
 		defer proxyConn.Close()
 
 		// SOCKS5 handshake
-		authMethods := []byte{0x05, 0x01, 0x00}
+		authMethods := []byte{0x05, 0x01, 0x00} // no auth
 		if s.cfg.AuthEnabled {
-			authMethods = []byte{0x05, 0x01, 0x02}
+			authMethods = []byte{0x05, 0x01, 0x02} // username/password
 		}
 		if _, err := proxyConn.Write(authMethods); err != nil {
 			return
@@ -1281,6 +1268,7 @@ func (s *ProxyServer) startAdminServer(addr string) *http.Server {
 			return
 		}
 
+		// Auth if needed
 		if s.cfg.AuthEnabled {
 			userBytes := []byte(s.cfg.Username)
 			passBytes := []byte(s.cfg.Password)
@@ -1299,24 +1287,26 @@ func (s *ProxyServer) startAdminServer(addr string) *http.Server {
 			}
 		}
 
-		host, portStr, err := net.SplitHostPort(target)
+		// SOCKS5 CONNECT request - parse target
+		host, portStr, err := net.SplitHostPort(string(target))
 		if err != nil {
 			return
 		}
 		port, _ := strconv.Atoi(portStr)
 
+		// Build CONNECT request
 		var connectReq []byte
-		connectReq = append(connectReq, 0x05, 0x01, 0x00)
+		connectReq = append(connectReq, 0x05, 0x01, 0x00) // VER, CMD=CONNECT, RSV
 
 		ip := net.ParseIP(host)
 		if ip4 := ip.To4(); ip4 != nil {
-			connectReq = append(connectReq, 0x01)
+			connectReq = append(connectReq, 0x01) // IPv4
 			connectReq = append(connectReq, ip4...)
 		} else if ip6 := ip.To16(); ip6 != nil {
-			connectReq = append(connectReq, 0x04)
+			connectReq = append(connectReq, 0x04) // IPv6
 			connectReq = append(connectReq, ip6...)
 		} else {
-			connectReq = append(connectReq, 0x03)
+			connectReq = append(connectReq, 0x03) // Domain
 			connectReq = append(connectReq, byte(len(host)))
 			connectReq = append(connectReq, []byte(host)...)
 		}
@@ -1326,6 +1316,7 @@ func (s *ProxyServer) startAdminServer(addr string) *http.Server {
 			return
 		}
 
+		// Read CONNECT response
 		connectResp := make([]byte, 10)
 		if _, err := io.ReadFull(proxyConn, connectResp); err != nil {
 			return
@@ -1334,13 +1325,34 @@ func (s *ProxyServer) startAdminServer(addr string) *http.Server {
 			return
 		}
 
-		// Bridge: raw TCP client <-> SOCKS5 proxy
+		// Bridge: WebSocket <-> SOCKS5 proxy
 		done := make(chan struct{})
 		go func() {
 			defer close(done)
-			io.Copy(proxyConn, clientConn)
+			buf := make([]byte, 32*1024)
+			for {
+				n, err := proxyConn.Read(buf)
+				if n > 0 {
+					conn.WriteMessage(websocket.BinaryMessage, buf[:n])
+				}
+				if err != nil {
+					return
+				}
+			}
 		}()
-		io.Copy(clientConn, proxyConn)
+		go func() {
+			defer conn.Close()
+			for {
+				_, msg, err := conn.ReadMessage()
+				if err != nil {
+					proxyConn.Close()
+					return
+				}
+				if _, err := proxyConn.Write(msg); err != nil {
+					return
+				}
+			}
+		}()
 		<-done
 	})
 
