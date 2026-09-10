@@ -31,12 +31,12 @@ RUN mkdir -p /app/data
 RUN addgroup -S appgroup && adduser -S appuser -G appgroup && chown -R appuser:appgroup /app
 USER appuser
 
-# Expose only HTTP ports (1080 is SOCKS5, not HTTP - Northflank probes all exposed ports)
-EXPOSE 8080 9090
+# Expose ports
+EXPOSE 1080 8080 9090
 
 # Health check
-HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
-    CMD wget -q --spider http://localhost:8080/health || exit 1
+HEALTHCHECK --interval=30s --timeout=3s \
+    CMD wget -q --spider http://localhost:8080 || exit 1
 
 # Run the application
 CMD ["./socks5-proxy", "config.json"]
