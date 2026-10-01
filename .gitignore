@@ -1,29 +1,46 @@
-# Binary
-socks5-proxy
-socks5-enterprise
-
-#Keep
-!data/.gitkeep
-
-# Go build artifacts
+# ─── Build output ──────────────────────────────────────────────────────────
+/socks5-proxy
+/socks5-enterprise
 *.exe
 *.exe~
-*.dll
-*.so
-*.dylib
 *.test
 *.out
-#DB
+coverage.*
+
+# ─── Secrets and local config ──────────────────────────────────────────────
+# The single most important entry: .env is where deployment credentials live.
+.env
+.env.*
+!.env.example
+# Never commit real tunnel tokens or certificates.
+*.pem
+*.key
+*.crt
+!web/**
+creds.txt
+
+# ─── Runtime data ──────────────────────────────────────────────────────────
+# SQLite database and its WAL/SHM sidecars. Only .gitkeep is tracked.
+data/*
+!data/.gitkeep
 *.db
 *.db-*
+*.sqlite
+*.sqlite-*
 
-# IDE
+# ─── Coverage, profiling and logs ──────────────────────────────────────────
+*.out
+profile.cgo
+*.prof
+*.log
+
+# ─── Editors and IDEs ──────────────────────────────────────────────────────
 .idea/
 .vscode/
 *.swp
 *.swo
 *~
 
-# OS
+# ─── OS ────────────────────────────────────────────────────────────────────
 .DS_Store
 Thumbs.db

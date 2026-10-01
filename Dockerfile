@@ -1,42 +1,66 @@
-# Stage 1: Build the Go application
+# syntax=docker/dockerfile:1
+
+# ─── Build ─────────────────────────────────────────────────────────────────
 FROM golang:1.24-alpine AS builder
 
 WORKDIR /app
 
-# Copy source code
-COPY . .
-
-# Download dependencies
+# Dependencies are copied first so the module cache layer survives source edits.
+COPY go.mod go.sum ./
 RUN go mod download
 
-# Build the application
-RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o socks5-proxy .
+COPY . .
 
-# Stage 2: Create the production image
-FROM alpine:latest
+# Static binary: CGO off so it runs on a scratch-like base with no libc.
+# -trimpath keeps build paths out of the binary; the ldflags strip debug info.
+RUN CGO_ENABLED=0 GOOS=linux go build \
+      -trimpath \
+      -ldflags="-s -w" \
+      -o /out/socks5-proxy .
+
+# Fail the build rather than ship something that will not start.
+RUN /out/socks5-proxy version
+
+# ─── Runtime ───────────────────────────────────────────────────────────────
+FROM alpine:3.22
+
+LABEL org.opencontainers.image.title="socks5-proxy" \
+      org.opencontainers.image.description="SOCKS5 proxy with single-port multiplexing, HTTP proxying and a WebSocket tunnel" \
+      org.opencontainers.image.source="https://github.com/OWNER/socks5-proxy" \
+      org.opencontainers.image.licenses="MIT"
 
 WORKDIR /app
 
-# Copy the binary from the builder stage
-COPY --from=builder /app/socks5-proxy .
+# wget is used by the health check; ca-certificates for outbound TLS.
+RUN apk add --no-cache ca-certificates wget \
+ && addgroup -S appgroup \
+ && adduser -S appuser -G appgroup
 
-# Copy configuration and web assets
+COPY --from=builder /out/socks5-proxy ./socks5-proxy
 COPY config.json .
 COPY web ./web
+# MIT requires the notice to travel with distributed copies.
+COPY LICENSE .
 
-# Create data directory for SQLite persistence
-RUN mkdir -p /app/data
+# SQLite lives here. Created and owned up front so the non-root user can write.
+RUN mkdir -p /app/data && chown -R appuser:appgroup /app
 
-# Create a non-root user
-RUN addgroup -S appgroup && adduser -S appuser -G appgroup && chown -R appuser:appgroup /app
 USER appuser
 
-# Expose ports
+# Default multi-port layout. Single-port mode is enabled by supplying PORT or
+# SINGLE_PORT, which is what PaaS providers inject automatically:
+#
+#   docker run -e PORT=8080 -p 8080:8080 socks5-proxy      # one port, anywhere
+#   docker run -p 1080:1080 -p 8080:8080 -p 9090:9090 ...  # three ports, VPS
+#
+# PORT is deliberately NOT baked in: setting it would force single-port mode on
+# every local run and silently stop listening on 9090. Supply it at run time to
+# opt into single-port mode (PaaS providers inject it automatically).
 EXPOSE 1080 8080 9090
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=3s \
-    CMD wget -q --spider http://localhost:8080 || exit 1
+# /health is always reachable without admin credentials. The probe mirrors the
+# precedence in LoadConfig: SINGLE_PORT wins over PORT, which wins over 8080.
+HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
+    CMD wget -q --spider "http://localhost:${SINGLE_PORT:-${PORT:-8080}}/health" || exit 1
 
-# Run the application
 CMD ["./socks5-proxy", "config.json"]

@@ -8,10 +8,21 @@
   "password": "changeme",
   "whitelist": [],
   "blacklist": [],
+  "read_timeout_seconds": 30,
+  "write_timeout_seconds": 30,
+  "idle_timeout_seconds": 300,
   "admin_auth_enabled": true,
   "admin_username": "admin",
   "admin_password": "changeme",
   "security_headers_enabled": true,
   "rate_limit_enabled": true,
-  "rate_limit_rps": 30
+  "rate_limit_rps": 30,
+  "single_port": 0,
+  "tunnel_enabled": false,
+  "tunnel_token": "",
+  "tunnel_path": "/api/v1/tunnel",
+  "tunnel_padding": 256,
+  "tunnel_rate_limit_rps": 5,
+  "tls_cert_file": "",
+  "tls_key_file": ""
 }

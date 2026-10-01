@@ -3,6 +3,7 @@ module socks5-enterprise
 go 1.24
 
 require (
+	github.com/coder/websocket v1.8.15
 	github.com/prometheus/client_golang v1.16.0
 	modernc.org/sqlite v1.34.5
 )
