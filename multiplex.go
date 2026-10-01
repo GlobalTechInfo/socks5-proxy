@@ -728,6 +728,12 @@ func (s *ProxyServer) serveMultiplex(addr string) error {
 	if tunnelPath == "" {
 		tunnelPath = defaultTunnelPath
 	}
+	// http.ServeMux panics on a pattern that does not start with "/", so a
+	// missing slash would take the whole process down at startup. Fail with a
+	// usable message instead.
+	if !strings.HasPrefix(tunnelPath, "/") {
+		return fmt.Errorf("tunnel_path must start with %q, got %q", "/", tunnelPath)
+	}
 	// Tell the auth layer which path to skip (basicAuth reads this).
 	tunnelPublicPath = tunnelPath
 
