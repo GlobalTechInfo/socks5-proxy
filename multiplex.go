@@ -573,19 +573,6 @@ func (f *forwardProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 //
 // r.BasicAuth() is deliberately not used: it only reads the "Authorization"
 // header, and a forward proxy receives its credentials in "Proxy-Authorization".
-// requestIP extracts the peer address for an HTTP request. In single-port mode
-// this is always a real TCP peer, so the RemoteAddr is authoritative; the
-// bracketed form from SplitHostPort is stripped.
-func requestIP(r *http.Request) string {
-	if r == nil {
-		return "unknown"
-	}
-	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
-		return host
-	}
-	return r.RemoteAddr
-}
-
 func validProxyAuth(r *http.Request, wantUser, wantPass string) bool {
 	h := r.Header.Get("Proxy-Authorization")
 	const prefix = "Basic "
@@ -660,8 +647,9 @@ func (s *ProxyServer) tunnelHandler(w http.ResponseWriter, r *http.Request) {
 		conn = newPadConn(conn, cfg.TunnelPadding)
 	}
 
-	s.logger.Info("tunnel session opened", "remote", r.RemoteAddr, "padding", cfg.TunnelPadding)
-	s.handleClient(conn)
+	clientIP := requestIP(r)
+	s.logger.Info("tunnel session opened", "client", clientIP, "padding", cfg.TunnelPadding)
+	s.handleClient(conn, clientIP)
 }
 
 // cancelConn ties a context cancel to Close, so tearing down the SOCKS5 session
@@ -889,7 +877,7 @@ func (s *ProxyServer) dispatchMultiplex(conn net.Conn, tlsCfg *tls.Config, httpS
 	switch {
 	case first == socks5Greeting:
 		clearSniffDeadlines(conn)
-		s.handleClient(newReplayConn(conn, br))
+		s.handleClient(newReplayConn(conn, br), remoteIP(conn))
 
 	case first == tlsRecordHandshake:
 		tlsConn := tls.Server(newReplayConn(conn, br), tlsCfg)
@@ -909,7 +897,7 @@ func (s *ProxyServer) dispatchMultiplex(conn net.Conn, tlsCfg *tls.Config, httpS
 		wrapped := newReplayConn(tlsConn, inner)
 		switch {
 		case firstDecrypted == socks5Greeting:
-			s.handleClient(wrapped)
+			s.handleClient(wrapped, remoteIP(tlsConn))
 		case isHTTPFirstByte(firstDecrypted):
 			s.serveSingleHTTP(wrapped, httpSrv)
 		default:

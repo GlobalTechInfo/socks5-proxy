@@ -234,6 +234,34 @@ func LoadConfig(filename string) (Config, error) {
 	return cfg, nil
 }
 
+// requestIP resolves the client address for an HTTP request.
+//
+// On a public single port every connection arrives through the platform's edge,
+// so RemoteAddr is the edge's own private address (10.60.x.x on Northflank, and
+// the same story on Render and Koyeb). Logging that is useless, and worse, the
+// IP allowlist would be matching the proxy instead of the user. X-Forwarded-For
+// carries the originating address, so prefer it when present.
+//
+// This is only safe because every connection to this port is fronted by a proxy
+// we control. Exposed directly, a client could forge the header to bypass the
+// allowlist, which is why isAllowedIP is only reached on this path when the
+// operator has deliberately configured a whitelist.
+func requestIP(r *http.Request) string {
+	if r == nil {
+		return "unknown"
+	}
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		// Left-most entry is the original client; later entries are proxies.
+		if first := strings.TrimSpace(strings.Split(xff, ",")[0]); first != "" {
+			return first
+		}
+	}
+	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+		return host
+	}
+	return r.RemoteAddr
+}
+
 // remoteIP extracts the client IP from a connection. Tunnel sessions arrive as
 // non-TCP conns (WebSocket-backed), so the *net.TCPAddr assertion that used to
 // be here would panic on them.
@@ -252,6 +280,40 @@ func remoteIP(conn net.Conn) string {
 		return host
 	}
 	return addr.String()
+}
+
+// tuneConn applies throughput/latency tuning to an accepted TCP connection.
+//
+// Socket buffers: Go's default ~64KB receive window caps a long-RTT link at
+// roughly 64KB/RTT (~3Mbps at 160ms) regardless of how fast the local
+// connection is. 4MB lifts that ceiling by orders of magnitude on high-latency
+// logClientAbort reports a failed handshake at debug level when the peer simply
+// disconnected, and at error level when something else went wrong. A "connection
+// closed" or EOF during the handshake is normal traffic, and logging it as an
+// error buries real faults under noise from chat apps preconnecting.
+func logClientAbort(log *slog.Logger, msg string, err error) {
+	if isClientDisconnect(err) {
+		log.Debug(msg, "reason", "client disconnected")
+		return
+	}
+	log.Error(msg, "error", err)
+}
+
+// isClientDisconnect reports whether err is just the peer hanging up.
+func isClientDisconnect(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
+		return true
+	}
+	if isClosedConnError(err) {
+		return true
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "EOF") ||
+		strings.Contains(msg, "connection reset") ||
+		strings.Contains(msg, "broken pipe")
 }
 
 // tuneConn applies throughput/latency tuning to an accepted TCP connection.
@@ -495,14 +557,20 @@ func (s *ProxyServer) Stats() Stats {
 
 // ─── SOCKS5 Protocol Implementation ────────────────────────────────────────
 
-func (s *ProxyServer) handleClient(conn net.Conn) {
+// handleClient runs a SOCKS5 session. clientIPOverride carries the originating
+// address when the session arrived through a reverse proxy, since the conn's
+// own RemoteAddr is then the edge's private IP.
+func (s *ProxyServer) handleClient(conn net.Conn, clientIPOverride string) {
 	s.wg.Add(1)
 	defer s.wg.Done()
 
 	s.trackConn(conn)
 	defer s.untrackConn(conn)
 
-	clientIP := remoteIP(conn)
+	clientIP := clientIPOverride
+	if clientIP == "" {
+		clientIP = remoteIP(conn)
+	}
 	log := s.logger.With("client", clientIP)
 
 	// Snapshot config under lock for this connection's lifetime
@@ -528,7 +596,9 @@ func (s *ProxyServer) handleClient(conn net.Conn) {
 	// Step 1: Method negotiation (RFC 1928 Section 3)
 	method, err := s.negotiateMethod(conn, &cfgSnap)
 	if err != nil {
-		log.Error("method negotiation failed", "error", err)
+		// Clients hang up mid-handshake routinely, including preconnect probes
+		// from chat apps, so this is not an operator-actionable fault.
+		logClientAbort(log, "method negotiation failed", err)
 		metricConnErrors.WithLabelValues("method_negotiation").Inc()
 		return
 	}
@@ -540,7 +610,7 @@ func (s *ProxyServer) handleClient(conn net.Conn) {
 		if err != nil {
 			s.authFailures.Add(1)
 			metricAuthFailures.Inc()
-			log.Error("authentication failed", "error", err)
+			logClientAbort(log, "authentication failed", err)
 			return
 		}
 		authenticatedUser = user
@@ -1793,7 +1863,9 @@ func runServer(logger *slog.Logger, configFile string) {
 					continue
 				}
 
-				go server.handleClient(conn)
+				// Empty override: this is a direct TCP connection, so the
+				// conn's own address is the client.
+				go server.handleClient(conn, "")
 			}
 		}()
 	}
@@ -1861,44 +1933,78 @@ const metricsDashboard = `<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>SOCKS5 Proxy Metrics</title>
+<script>
+// Applied before first paint so the page never flashes the wrong palette.
+(function(){
+  var t=null;
+  try{t=localStorage.getItem('socks5-theme');}catch(e){}
+  if(t==='light'||t==='dark'){document.documentElement.setAttribute('data-theme',t);}
+})();
+</script>
 <script src="/chart.min.js"></script>
 <style>
   *{margin:0;padding:0;box-sizing:border-box}
-  body{background:#0a0a0f;color:#e0e0e0;font-family:'Courier New',monospace;overflow-x:hidden}
-  .grid{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;padding:20px;max-width:1600px;margin:0 auto}
-  .card{background:linear-gradient(145deg,#12121a,#1a1a2e);border:1px solid #1e1e3a;border-radius:12px;padding:20px;position:relative;overflow:hidden}
-  .card::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;background:linear-gradient(90deg,transparent,#00f0ff,transparent)}
-  .card h3{font-size:11px;text-transform:uppercase;letter-spacing:2px;color:#555;margin-bottom:8px}
-  .card .value{font-size:32px;font-weight:bold;background:linear-gradient(135deg,#00f0ff,#7b2dff);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
-  .card .sub{font-size:11px;color:#444;margin-top:4px}
-  .charts{display:grid;grid-template-columns:1fr 1fr;gap:16px;padding:0 20px 20px;max-width:1600px;margin:0 auto}
-  .chart-box{background:linear-gradient(145deg,#12121a,#1a1a2e);border:1px solid #1e1e3a;border-radius:12px;padding:20px;position:relative;overflow:hidden;min-height:280px}
+  :root{
+    --bg:#f2f4f7;--bg-elevated:#ffffff;--border:#d5dae2;--text:#1c2430;
+    --muted:#5b6675;--faint:#8a94a3;--accent:#0a7ea4;--accent2:#5b3fd6;
+    --accent-ink:#0b1220;--tip-bg:#e3e8ef;--shadow:rgba(20,30,45,0.10);--grid:rgba(0,0,0,0.07);
+  }
+  @media(prefers-color-scheme:dark){:root:not([data-theme]){
+    --bg:#0a0a0f;--bg-elevated:#12121a;--border:#1e1e3a;--text:#e0e0e0;
+    --muted:#8a8fa0;--faint:#555;--accent:#00f0ff;--accent2:#7b2dff;
+    --accent-ink:#0a0a0f;--tip-bg:#1e1e3a;--shadow:rgba(0,0,0,0.4);--grid:rgba(255,255,255,0.07);
+  }}
+  :root[data-theme="dark"]{
+    --bg:#0a0a0f;--bg-elevated:#12121a;--border:#1e1e3a;--text:#e0e0e0;
+    --muted:#8a8fa0;--faint:#555;--accent:#00f0ff;--accent2:#7b2dff;
+    --accent-ink:#0a0a0f;--tip-bg:#1e1e3a;--shadow:rgba(0,0,0,0.4);--grid:rgba(255,255,255,0.07);
+  }
+  :root[data-theme="light"]{
+    --bg:#f2f4f7;--bg-elevated:#ffffff;--border:#d5dae2;--text:#1c2430;
+    --muted:#5b6675;--faint:#8a94a3;--accent:#0a7ea4;--accent2:#5b3fd6;
+    --accent-ink:#0b1220;--tip-bg:#e3e8ef;--shadow:rgba(20,30,45,0.10);--grid:rgba(0,0,0,0.07);
+  }
+  html[data-theme]{color-scheme:light}
+  html[data-theme="dark"]{color-scheme:dark}
+  body{background:var(--bg);color:var(--text);font-family:'Courier New',monospace;overflow-x:hidden;transition:background 0.2s,color 0.2s}
+  .grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:16px;padding:20px;max-width:1600px;margin:0 auto}
+  .card{background:var(--bg-elevated);border:1px solid var(--border);box-shadow:0 1px 2px var(--shadow);border-radius:12px;padding:20px;position:relative;overflow:hidden}
+  .card::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;background:linear-gradient(90deg,transparent,var(--accent),transparent)}
+  .card h3{font-size:11px;text-transform:uppercase;letter-spacing:2px;color:var(--muted);margin-bottom:8px}
+  .card .value{font-size:32px;font-weight:bold;background:linear-gradient(135deg,var(--accent),var(--accent2));-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+  .card .sub{font-size:11px;color:var(--faint);margin-top:4px}
+  .charts{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px;padding:0 20px 20px;max-width:1600px;margin:0 auto}
+  .chart-box{background:var(--bg-elevated);border:1px solid var(--border);box-shadow:0 1px 2px var(--shadow);border-radius:12px;padding:20px;position:relative;overflow:hidden;min-height:280px}
   .chart-box canvas{position:relative;width:100%!important;height:220px!important}
-  .chart-box::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;background:linear-gradient(90deg,transparent,#7b2dff,transparent)}
-  .chart-box h2{font-size:12px;text-transform:uppercase;letter-spacing:3px;color:#555;margin-bottom:15px}
+  .chart-box::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;background:linear-gradient(90deg,transparent,var(--accent2),transparent)}
+  .chart-box h2{font-size:12px;text-transform:uppercase;letter-spacing:3px;color:var(--muted);margin-bottom:15px}
   .full-width{grid-column:1/-1}
   .bar-chart{display:flex;align-items:flex-end;gap:4px;height:220px;padding-top:10px}
-  .bar{flex:1;background:linear-gradient(180deg,#00f0ff,#7b2dff);border-radius:4px 4px 0 0;min-width:20px;position:relative;transition:height 0.5s ease;cursor:pointer}
+  .bar{flex:1;background:linear-gradient(180deg,var(--accent),var(--accent2));border-radius:4px 4px 0 0;min-width:20px;position:relative;transition:height 0.5s ease;cursor:pointer}
   .bar:hover{opacity:0.8}
-  .bar .label{position:absolute;bottom:-20px;left:50%;transform:translateX(-50%);font-size:8px;color:#555;white-space:nowrap;max-width:60px;overflow:hidden;text-overflow:ellipsis}
-  .bar .tip{position:absolute;top:-25px;left:50%;transform:translateX(-50%);background:#1e1e3a;color:#00f0ff;padding:2px 6px;border-radius:4px;font-size:10px;white-space:nowrap;opacity:0;transition:opacity 0.2s}
+  .bar .label{position:absolute;bottom:-20px;left:50%;transform:translateX(-50%);font-size:8px;color:var(--faint);white-space:nowrap;max-width:60px;overflow:hidden;text-overflow:ellipsis}
+  .bar .tip{position:absolute;top:-25px;left:50%;transform:translateX(-50%);background:var(--tip-bg);color:var(--accent);padding:2px 6px;border-radius:4px;font-size:10px;white-space:nowrap;opacity:0;transition:opacity 0.2s}
   .bar:hover .tip{opacity:1}
   .timeline{display:flex;gap:1px;height:60px;align-items:flex-end}
-  .tick{flex:1;background:#00f0ff;border-radius:1px;min-height:2px;transition:height 0.3s;opacity:0.7}
-  .header{padding:20px;text-align:center;border-bottom:1px solid #1e1e3a}
-  .header h1{font-size:14px;letter-spacing:8px;text-transform:uppercase;background:linear-gradient(135deg,#00f0ff,#7b2dff);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
-  .header .pulse{display:inline-block;width:8px;height:8px;background:#00f0ff;border-radius:50%;margin-right:10px;animation:pulse 2s infinite}
-  @keyframes pulse{0%,100%{opacity:1;box-shadow:0 0 10px #00f0ff}50%{opacity:0.5;box-shadow:0 0 5px #00f0ff}}
+  .tick{flex:1;background:var(--accent);border-radius:1px;min-height:2px;transition:height 0.3s;opacity:0.7}
+  .header{padding:20px;text-align:center;border-bottom:1px solid var(--border);position:relative}
+  .theme-toggle{position:absolute;right:16px;top:50%;transform:translateY(-50%);width:36px;height:36px;border:1px solid var(--border);background:var(--bg-elevated);color:var(--muted);border-radius:8px;cursor:pointer;font-size:15px;line-height:1;display:flex;align-items:center;justify-content:center;transition:all 0.2s}
+  .theme-toggle:hover{color:var(--accent);border-color:var(--accent)}
+  .theme-toggle:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+  .header h1{font-size:14px;letter-spacing:8px;text-transform:uppercase;background:linear-gradient(135deg,var(--accent),var(--accent2));-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+  .header .pulse{display:inline-block;width:8px;height:8px;background:var(--accent);border-radius:50%;margin-right:10px;animation:pulse 2s infinite}
+  @keyframes pulse{0%,100%{opacity:1;box-shadow:0 0 10px var(--accent)}50%{opacity:0.5;box-shadow:0 0 5px var(--accent)}}
   .glow{animation:glow 3s ease-in-out infinite alternate}
-  @keyframes glow{from{text-shadow:0 0 5px #00f0ff}to{text-shadow:0 0 20px #00f0ff,0 0 40px #7b2dff}}
+  @keyframes glow{from{text-shadow:0 0 5px var(--accent)}to{text-shadow:0 0 20px var(--accent),0 0 40px var(--accent2)}}
   canvas{width:100%!important;height:220px!important}
-  @media(max-width:900px){.grid{grid-template-columns:1fr 1fr}.charts{grid-template-columns:1fr}}
-  @media(max-width:500px){.grid{grid-template-columns:1fr}}
+  @media(max-width:900px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))}.charts{grid-template-columns:minmax(0,1fr)}}
+  @media(max-width:500px){.grid{grid-template-columns:minmax(0,1fr)}.grid,.charts,.section{padding-left:12px;padding-right:12px}.header h1{letter-spacing:3px;font-size:13px}.card{padding:14px}.theme-toggle{right:12px}}
 </style>
 </head>
 <body>
 <div class="header">
   <h1><span class="pulse"></span>SOCKS5 Proxy Metrics</h1>
+  <button type="button" class="theme-toggle" id="theme-toggle" aria-label="Toggle colour theme" title="Toggle colour theme">&#9681;</button>
 </div>
 
 <div class="grid">
@@ -1928,16 +2034,69 @@ const metricsDashboard = `<!DOCTYPE html>
 </div>
 
 <script>
+// -- Theme --------------------------------------------------------------------
+// Explicit choice wins, then the stored value, then the OS preference. Chart.js
+// bakes colours in at draw time, so charts are re-themed on switch.
+var Theme={
+  get:function(){
+    var explicit=document.documentElement.getAttribute('data-theme');
+    if(explicit)return explicit;
+    return window.matchMedia&&window.matchMedia('(prefers-color-scheme: light)').matches?'light':'dark';
+  },
+  apply:function(mode){
+    document.documentElement.setAttribute('data-theme',mode);
+    try{localStorage.setItem('socks5-theme',mode);}catch(e){}
+    var b=document.getElementById('theme-toggle');
+    if(b){b.textContent=mode==='dark'?'\u25D1':'\u2600';}
+    Theme.retheme();
+  },
+  toggle:function(){Theme.apply(Theme.get()==='dark'?'light':'dark');},
+  retheme:function(){
+    var cs=getComputedStyle(document.documentElement);
+    var v=function(n){return cs.getPropertyValue(n).trim();};
+    var p={accent:v('--accent'),accent2:v('--accent2'),muted:v('--muted'),faint:v('--faint'),grid:v('--grid')};
+    [chartConn,chartDest,chartAuth,chartBlocked].forEach(function(ch){
+      if(!ch)return;
+      if(ch.options.scales&&ch.options.scales.y){
+        ch.options.scales.y.grid.color=p.grid;
+        ch.options.scales.y.ticks.color=p.faint;
+      }
+      if(ch.options.plugins&&ch.options.plugins.legend&&ch.options.plugins.legend.labels){
+        ch.options.plugins.legend.labels.color=p.muted;
+      }
+      ch.update('none');
+    });
+  }
+};
+document.addEventListener('DOMContentLoaded',function(){
+  var b=document.getElementById('theme-toggle');
+  if(b){
+    b.textContent=Theme.get()==='dark'?'\u25D1':'\u2600';
+    b.addEventListener('click',Theme.toggle);
+  }
+  if(window.matchMedia){
+    var mq=window.matchMedia('(prefers-color-scheme: light)');
+    var onChange=function(){
+      if(!document.documentElement.getAttribute('data-theme')){
+        Theme.apply(mq.matches?'light':'dark');
+      }
+    };
+    if(mq.addEventListener)mq.addEventListener('change',onChange);
+    else if(mq.addListener)mq.addListener(onChange);
+  }
+});
+// -- End theme ----------------------------------------------------------------
 var timelineData=[];
 for(var i=0;i<60;i++)timelineData.push(0);
 
-var chartOpts={responsive:true,maintainAspectRatio:false,animation:{duration:300},plugins:{legend:{display:false}},scales:{x:{display:false},y:{beginAtZero:true,grid:{color:'#1e1e3a'},ticks:{color:'#444',font:{family:'Courier New',size:10}}}}};
+var _p=(function(){var cs=getComputedStyle(document.documentElement);var v=function(n){return cs.getPropertyValue(n).trim()};return{accent:v('--accent'),accent2:v('--accent2'),muted:v('--muted'),faint:v('--faint'),grid:v('--grid')}})();
+var chartOpts={responsive:true,maintainAspectRatio:false,animation:{duration:300},plugins:{legend:{display:false}},scales:{x:{display:false},y:{beginAtZero:true,grid:{color:_p.grid},ticks:{color:_p.faint,font:{family:'Courier New',size:10}}}}};
 
 var ctxConn=document.getElementById('chart-connections').getContext('2d');
-var chartConn=new Chart(ctxConn,{type:'line',data:{labels:[],datasets:[{label:'Active',data:[],borderColor:'#00f0ff',backgroundColor:'rgba(0,240,255,0.1)',fill:true,tension:0.4,pointRadius:0,borderWidth:2},{label:'Total',data:[],borderColor:'#7b2dff',backgroundColor:'rgba(123,45,255,0.1)',fill:true,tension:0.4,pointRadius:0,borderWidth:2}]},options:{...chartOpts,plugins:{legend:{display:true,labels:{color:'#555',font:{family:'Courier New',size:10}}}}}});
+var chartConn=new Chart(ctxConn,{type:'line',data:{labels:[],datasets:[{label:'Active',data:[],borderColor:_p.accent,backgroundColor:'rgba(127,127,127,0.12)',fill:true,tension:0.4,pointRadius:0,borderWidth:2},{label:'Total',data:[],borderColor:_p.accent2,backgroundColor:'rgba(127,127,127,0.12)',fill:true,tension:0.4,pointRadius:0,borderWidth:2}]},options:{...chartOpts,plugins:{legend:{display:true,labels:{color:_p.muted,font:{family:'Courier New',size:10}}}}}});
 
 var ctxDest=document.getElementById('chart-destinations').getContext('2d');
-var chartDest=new Chart(ctxDest,{type:'doughnut',data:{labels:[],datasets:[{data:[],backgroundColor:['#00f0ff','#7b2dff','#ff006e','#ffbe0b','#00f5d4','#fee440','#f15bb5','#9b5de5']}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{position:'right',labels:{color:'#555',font:{family:'Courier New',size:10},boxWidth:12,padding:8}}}}});
+var chartDest=new Chart(ctxDest,{type:'doughnut',data:{labels:[],datasets:[{data:[],backgroundColor:['#00f0ff','#7b2dff','#ff006e','#ffbe0b','#00f5d4','#fee440','#f15bb5','#9b5de5']}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{position:'right',labels:{color:_p.muted,font:{family:'Courier New',size:10},boxWidth:12,padding:8}}}}});
 
 var ctxAuth=document.getElementById('chart-auth').getContext('2d');
 var chartAuth=new Chart(ctxAuth,{type:'bar',data:{labels:[],datasets:[{data:[],backgroundColor:'rgba(255,0,110,0.6)',borderColor:'#ff006e',borderWidth:1,borderRadius:4}]},options:chartOpts});

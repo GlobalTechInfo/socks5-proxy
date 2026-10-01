@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -1145,5 +1146,59 @@ func TestDisabledTunnelIgnoresPath(t *testing.T) {
 func TestRoutePatternAllowsUnicodeWhitespace(t *testing.T) {
 	if err := validateRoutePattern("tunnel_path", "/tunnel\u00a0"); err != nil {
 		t.Fatalf("unicode whitespace rejected: %v", err)
+	}
+}
+
+func TestRequestIPPrefersForwardedFor(t *testing.T) {
+	cases := []struct {
+		name   string
+		header string
+		remote string
+		want   string
+	}{
+		{"single hop", "203.0.113.7", "10.60.0.1:1234", "203.0.113.7"},
+		{"left-most of chain", "203.0.113.7, 70.41.3.18, 10.60.0.1", "10.60.0.1:1234", "203.0.113.7"},
+		{"padded entry", "  203.0.113.7  ", "10.60.0.1:1234", "203.0.113.7"},
+		{"absent falls back to peer", "", "198.51.100.9:5555", "198.51.100.9"},
+		{"empty entry falls back", "   ", "198.51.100.9:5555", "198.51.100.9"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := httptest.NewRequest(http.MethodGet, "/", nil)
+			r.RemoteAddr = tc.remote
+			if tc.header != "" {
+				r.Header.Set("X-Forwarded-For", tc.header)
+			}
+			if got := requestIP(r); got != tc.want {
+				t.Fatalf("requestIP = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestRemoteIPIgnoresAddrType(t *testing.T) {
+	// Tunnel sessions arrive as non-TCP conns; this must not panic on them.
+	if got := remoteIP(nil); got != "unknown" {
+		t.Fatalf("remoteIP(nil) = %q, want unknown", got)
+	}
+	c, srv := net.Pipe()
+	defer c.Close()
+	defer srv.Close()
+	if got := remoteIP(c); got == "" {
+		t.Fatal("remoteIP returned empty for live conn")
+	}
+}
+
+func TestIsClientDisconnectClassifiesHandshakeNoise(t *testing.T) {
+	for _, err := range []error{io.EOF, net.ErrClosed, errors.New("read: connection reset by peer"), errors.New("write: broken pipe")} {
+		if !isClientDisconnect(err) {
+			t.Fatalf("isClientDisconnect(%v) = false, want true", err)
+		}
+	}
+	if isClientDisconnect(errors.New("socks auth method negotiation failed")) {
+		t.Fatal("real protocol error misclassified as client disconnect")
+	}
+	if isClientDisconnect(nil) {
+		t.Fatal("nil misclassified as client disconnect")
 	}
 }
