@@ -61,7 +61,7 @@ port, dispatched on the first byte or request shape.
 | Protocol | Endpoint | Used by |
 |---|---|---|
 | **SOCKS5** | `:1080` | Native SOCKS5 clients, on hosts that permit raw TCP |
-| **SOCKS5 over WebSocket** | `/tunnel` | SOCKS5 clients where raw TCP is blocked, via the bundled client |
+| **SOCKS5 over WebSocket** | `/api/v1/tunnel` | SOCKS5 clients where raw TCP is blocked, via the bundled client |
 | **HTTP proxy** — `CONNECT` and absolute-form | single port | Browsers and any HTTP client with proxy support |
 | **HTTPS** | single port | TLS-wrapped access to any of the above |
 
@@ -134,9 +134,9 @@ Edit `config.json` or use environment variables (env vars override config file):
 
 | Env Variable | Default | Description |
 |---|---|---|
-| `PORT` | unset | Injected by Render/Koyeb/Heroku. Enables single-port mode automatically |
+| `PORT` | unset | Injected by Render/Koyeb/Heroku. Enables single-port mode automatically. Does **not** move the SOCKS5 port |
 | `SINGLE_PORT` | unset | Explicit single-port port. Takes precedence over `PORT`; needed on Northflank |
-| `PROXY_PORT` | 1080 | SOCKS5 proxy port (multi-port mode) |
+| `PROXY_PORT` | 1080 | SOCKS5 proxy port. Ignored when it equals `SINGLE_PORT`, since the mux already serves SOCKS5 |
 | `ADMIN_PORT` | 8080 | Admin dashboard port (multi-port mode) |
 | `METRICS_PORT` | 9090 | Metrics dashboard port (multi-port mode) |
 | `PROXY_USER` | changeme | SOCKS5 username, also the HTTP proxy user |
@@ -153,7 +153,7 @@ Edit `config.json` or use environment variables (env vars override config file):
 | `RATE_LIMIT_ENABLED` | true | Enable rate limiting on admin endpoints |
 | `RATE_LIMIT_RPS` | 30 | Admin requests per second per client |
 | `TUNNEL_ENABLED` | false | Enable the WebSocket tunnel. Refused at startup without a token |
-| `TUNNEL_TOKEN` | empty | Shared secret for `/tunnel` and the client |
+| `TUNNEL_TOKEN` | empty | Shared secret for the tunnel path and the client |
 | `TUNNEL_PATH` | /api/v1/tunnel | Tunnel URL path |
 | `TUNNEL_PADDING` | 256 | Message padding size; 0 or 1 disables |
 | `TUNNEL_RATE_LIMIT_RPS` | 5 | Tunnel handshakes per second. Raise for bursty clients |
@@ -176,7 +176,9 @@ Multi-port mode (default):
 | 8080 | Admin Dashboard |
 | 9090 | Metrics Dashboard + Prometheus |
 
-Single-port mode serves all of these on `$SINGLE_PORT` (or `$PORT`), plus `/tunnel` and `/tls-cert`. Port 1080 stays bound even in this mode, so direct SOCKS5 keeps working wherever the host allows raw TCP.
+Single-port mode serves all of these on `$SINGLE_PORT` (or `$PORT`), plus the
+tunnel path and `/tls-cert`. When `$SINGLE_PORT` equals `$PROXY_PORT` the extra
+SOCKS5 listener is skipped, because the mux already serves SOCKS5 on that port.
 
 ## Commands
 
@@ -206,7 +208,11 @@ padding framing, config/env resolution, and non-TCP conn handling.
 - **Change `PROXY_PASS`, `ADMIN_PASS` and `TUNNEL_TOKEN` before exposing the
   service.** The shipped defaults are `changeme`.
 - The server **refuses to start** if `TUNNEL_ENABLED` is set without
-  `TUNNEL_TOKEN`, so a misconfigured fork cannot become an open relay.
+  `TUNNEL_TOKEN`, so a misconfigured fork cannot become an open relay. With
+  `TUNNEL_ENABLED=false` the tunnel path is not even registered, regardless of
+  any token left in the config.
+- `whitelist` and `blacklist` apply to the SOCKS5 port, the HTTP proxy
+  (`CONNECT` and forward) and the tunnel alike.
 - `/health`, `/metrics`, `/prometheus`, `/api/live`, `/tls-cert` and the tunnel
   are reachable without admin credentials. Everything else needs basic auth.
 - The HTTP proxy reuses the SOCKS5 credentials and is only served in

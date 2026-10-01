@@ -939,3 +939,150 @@ func TestDashboardStillWorksOnSharedPort(t *testing.T) {
 		t.Fatalf("GET /health = %d, want 200", resp.StatusCode)
 	}
 }
+
+// ─── Test 17: single-port mode cannot collide with the SOCKS5 port ─────────
+
+// PORT used to be copied into ProxyPort as well as SinglePort, so the mux and
+// the raw listener both bound the same value and the process exited. That broke
+// every PaaS deploy, where PORT is injected automatically.
+func TestPortNoLongerSetsProxyPort(t *testing.T) {
+	cfgFile := writeTempConfig(t, `{"proxy_port":1080}`)
+
+	t.Setenv("PORT", "8080")
+	t.Setenv("SINGLE_PORT", "")
+	t.Setenv("PROXY_PORT", "")
+	cfg, err := LoadConfig(cfgFile)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.SinglePort != 8080 {
+		t.Fatalf("SinglePort = %d, want 8080", cfg.SinglePort)
+	}
+	if cfg.ProxyPort != 1080 {
+		t.Fatalf("ProxyPort = %d, want 1080: PORT must not move the SOCKS5 port", cfg.ProxyPort)
+	}
+	if cfg.SinglePort == cfg.ProxyPort {
+		t.Fatal("SinglePort and ProxyPort must not collide by default")
+	}
+}
+
+// PROXY_PORT still works for moving the SOCKS5 port explicitly.
+func TestProxyPortStillHonoured(t *testing.T) {
+	cfgFile := writeTempConfig(t, `{"proxy_port":1080}`)
+	t.Setenv("PORT", "8080")
+	t.Setenv("PROXY_PORT", "9999")
+	cfg, err := LoadConfig(cfgFile)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.ProxyPort != 9999 {
+		t.Fatalf("ProxyPort = %d, want 9999", cfg.ProxyPort)
+	}
+}
+
+// ─── Test 18: TUNNEL_ENABLED=false really disables the tunnel ─────────────
+
+// The handler used to check only for a token, so an operator who set
+// TUNNEL_ENABLED=false but left a token behind still had a live tunnel.
+func TestTunnelDisabledDespiteToken(t *testing.T) {
+	addr := startTestServer(t, func(c *Config) {
+		c.TunnelEnabled = false
+		c.TunnelToken = "test-token"
+	})
+
+	for _, path := range []string{defaultTunnelPath, defaultTunnelPath + "?token=test-token"} {
+		resp, err := http.Get("http://" + addr + path)
+		if err != nil {
+			t.Fatalf("GET %s: %v", path, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode == http.StatusSwitchingProtocols || resp.StatusCode == http.StatusOK {
+			t.Errorf("GET %s = %d: tunnel reachable while disabled", path, resp.StatusCode)
+		}
+	}
+}
+
+// ─── Test 19: the HTTP proxy honours the IP allowlist ──────────────────────
+
+// CONNECT and forward-proxy paths skipped isAllowedIP, so a blacklisted client
+// could relay through the proxy around the operator's own access control.
+func TestProxyPathsEnforceIPAllowlist(t *testing.T) {
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "should not be reachable")
+	}))
+	defer origin.Close()
+
+	addr := startTestServer(t, func(c *Config) {
+		c.AuthEnabled = true
+		c.Username = "auser"
+		c.Password = "apass"
+		c.Blacklist = []string{"127.0.0.1"}
+	})
+
+	t.Run("CONNECT blocked", func(t *testing.T) {
+		conn, err := net.DialTimeout("tcp", addr, 3*time.Second)
+		if err != nil {
+			t.Fatalf("dial: %v", err)
+		}
+		defer conn.Close()
+		conn.SetDeadline(time.Now().Add(5 * time.Second))
+		target := origin.Listener.Addr().String()
+		fmt.Fprintf(conn, "CONNECT %s HTTP/1.1\r\nHost: %s\r\nProxy-Authorization: Basic %s\r\n\r\n",
+			target, target, basicAuthValue("auser", "apass"))
+		resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+		if err != nil {
+			t.Fatalf("read: %v", err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusForbidden {
+			t.Fatalf("CONNECT from blacklisted IP = %d, want 403", resp.StatusCode)
+		}
+	})
+
+	t.Run("forward proxy blocked", func(t *testing.T) {
+		conn, err := net.DialTimeout("tcp", addr, 3*time.Second)
+		if err != nil {
+			t.Fatalf("dial: %v", err)
+		}
+		defer conn.Close()
+		conn.SetDeadline(time.Now().Add(5 * time.Second))
+		originURL := "http://" + origin.Listener.Addr().String() + "/x"
+		fmt.Fprintf(conn, "GET %s HTTP/1.1\r\nHost: h\r\nProxy-Authorization: Basic %s\r\nConnection: close\r\n\r\n",
+			originURL, basicAuthValue("auser", "apass"))
+		resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+		if err != nil {
+			t.Fatalf("read: %v", err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusForbidden {
+			t.Fatalf("forward proxy from blacklisted IP = %d, want 403", resp.StatusCode)
+		}
+	})
+}
+
+// ─── Test 20: protocol sniffing is bounded ─────────────────────────────────
+
+// A silent peer must not park a goroutine and descriptor forever on the public
+// port, so the sniff has to time out.
+func TestSniffTimeoutClosesSilentConnection(t *testing.T) {
+	addr := startTestServer(t, nil)
+
+	// Connect and send nothing at all.
+	conn, err := net.DialTimeout("tcp", addr, 3*time.Second)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+
+	_ = conn.SetReadDeadline(time.Now().Add(20 * time.Second))
+	buf := make([]byte, 1)
+	// The server must give up first; sniffTimeout is 10s and the test budget 20s,
+	// so a read here returning an error (not data) proves the deadline fired.
+	if _, err := conn.Read(buf); err != nil {
+		if os.IsTimeout(err) {
+			t.Fatalf("client read timed out before the server closed: sniff deadline did not fire")
+		}
+		return // server closed the connection, which is what we want
+	}
+	t.Fatal("server sent data on a silent connection")
+}

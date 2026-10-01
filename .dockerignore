@@ -32,7 +32,6 @@ socks5-enterprise
 
 # Docs and compose files are not needed at runtime
 *.md
-LICENSE
 docker-compose*.yml
 docker-compose*.yaml
 compose*.yml

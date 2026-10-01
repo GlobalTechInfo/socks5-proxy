@@ -37,7 +37,10 @@ const (
 	tlsRecordHandshake = 0x16
 	defaultTunnelPath  = "/api/v1/tunnel"
 	keepaliveInterval  = 30 * time.Second
-	maxHandshakeBytes  = 16
+	// sniffTimeout bounds protocol detection so a silent peer cannot hold a
+	// goroutine and descriptor open on the public port.
+	sniffTimeout      = 10 * time.Second
+	maxHandshakeBytes = 16
 )
 
 // ─── Buffered Connection (peek replay) ─────────────────────────────────────
@@ -383,6 +386,16 @@ func (s *ProxyServer) connectHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "proxy auth is not configured", http.StatusForbidden)
 		return
 	}
+	// Same IP access control that handleClient applies on the SOCKS5 path.
+	// Checked before the limiter and the credentials so a blacklisted client
+	// cannot use the HTTP proxy to route around the operator's own rules.
+	if !s.isAllowedIP(requestIP(r)) {
+		s.blockedConns.Add(1)
+		metricBlockedConns.WithLabelValues(requestIP(r)).Inc()
+		s.logger.Warn("blocked IP on http proxy", "client", requestIP(r))
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
 	if !s.tunnelLimiter.allow() {
 		http.Error(w, "too many requests", http.StatusTooManyRequests)
 		return
@@ -493,6 +506,14 @@ func (s *ProxyServer) forwardProxyHandler(w http.ResponseWriter, r *http.Request
 		http.Error(w, "proxy auth is not configured", http.StatusProxyAuthRequired)
 		return
 	}
+	// Same IP access control as the SOCKS5 and CONNECT paths.
+	if !s.isAllowedIP(requestIP(r)) {
+		s.blockedConns.Add(1)
+		metricBlockedConns.WithLabelValues(requestIP(r)).Inc()
+		s.logger.Warn("blocked IP on forward proxy", "client", requestIP(r))
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
 	if !s.tunnelLimiter.allow() {
 		http.Error(w, "too many requests", http.StatusTooManyRequests)
 		return
@@ -552,6 +573,19 @@ func (f *forwardProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 //
 // r.BasicAuth() is deliberately not used: it only reads the "Authorization"
 // header, and a forward proxy receives its credentials in "Proxy-Authorization".
+// requestIP extracts the peer address for an HTTP request. In single-port mode
+// this is always a real TCP peer, so the RemoteAddr is authoritative; the
+// bracketed form from SplitHostPort is stripped.
+func requestIP(r *http.Request) string {
+	if r == nil {
+		return "unknown"
+	}
+	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+		return host
+	}
+	return r.RemoteAddr
+}
+
 func validProxyAuth(r *http.Request, wantUser, wantPass string) bool {
 	h := r.Header.Get("Proxy-Authorization")
 	const prefix = "Basic "
@@ -574,6 +608,12 @@ func validProxyAuth(r *http.Request, wantUser, wantPass string) bool {
 func (s *ProxyServer) tunnelHandler(w http.ResponseWriter, r *http.Request) {
 	cfg := s.currentConfig()
 
+	// Check the documented switch as well as the token. An operator who sets
+	// TUNNEL_ENABLED=false but leaves a token behind must actually get no tunnel.
+	if !cfg.TunnelEnabled {
+		http.Error(w, "tunnel disabled", http.StatusForbidden)
+		return
+	}
 	if cfg.TunnelToken == "" {
 		http.Error(w, "tunnel disabled", http.StatusForbidden)
 		return
@@ -707,7 +747,11 @@ func (s *ProxyServer) serveMultiplex(addr string) error {
 	}
 
 	tunnelMux := http.NewServeMux()
-	tunnelMux.HandleFunc(tunnelPath, s.tunnelHandler)
+	// Only advertise the tunnel when it is actually enabled, so a disabled
+	// tunnel does not answer 403 on a live path and looks absent to a prober.
+	if cfg.TunnelEnabled {
+		tunnelMux.HandleFunc(tunnelPath, s.tunnelHandler)
+	}
 	tunnelMux.HandleFunc("/tls-cert", s.tlsCertHandler(tlsCfg))
 
 	// admin first: its / serves the dashboard, and metrics-only paths fall through
@@ -773,6 +817,19 @@ func (s *ProxyServer) serveMultiplex(addr string) error {
 				continue
 			}
 			tuneConn(conn)
+
+			// Enforce the same connection ceiling as the raw-port accept loop.
+			// Without this the public single port is a cheaper way to exhaust
+			// resources than the dedicated SOCKS5 port.
+			s.configMu.RLock()
+			maxConns := s.cfg.MaxConns
+			s.configMu.RUnlock()
+			if s.activeConns.Load() >= int64(maxConns) {
+				s.logger.Warn("max connections reached, rejecting", "client", conn.RemoteAddr())
+				_ = conn.Close()
+				continue
+			}
+
 			go s.dispatchMultiplex(conn, tlsCfg, httpSrv)
 		}
 	}()
@@ -782,33 +839,45 @@ func (s *ProxyServer) serveMultiplex(addr string) error {
 }
 
 func (s *ProxyServer) dispatchMultiplex(conn net.Conn, tlsCfg *tls.Config, httpSrv *http.Server) {
-	// Ownership of conn is passed to whichever branch handles it: handleClient
-	// closes it via untrackConn, and http.Server closes it after the handler.
-	// Only the reject paths close it here.
+	// conn is closed on every path that does not hand it to a handler.
+	// handleClient closes it via untrackConn; http.Server closes it after the
+	// handler returns. Anything else is a leak, so each early return below
+	// defers a close.
+	//
+	// Without the sniff deadline, a client that connects and sends nothing
+	// parks this goroutine and its file descriptor indefinitely, which on a
+	// single public port is a cheap way to exhaust descriptors.
+	_ = conn.SetReadDeadline(time.Now().Add(sniffTimeout))
+	_ = conn.SetWriteDeadline(time.Now().Add(sniffTimeout))
 
-	// Sniff only as many bytes as the decision needs, so a plain SOCKS5 client
-	// is not delayed waiting for a buffer to fill.
 	br := newPeekReader(conn)
 
 	first, err := br.peekByte()
 	if err != nil {
+		_ = conn.Close()
 		return
 	}
 
 	switch {
 	case first == socks5Greeting:
+		clearSniffDeadlines(conn)
 		s.handleClient(newReplayConn(conn, br))
 
 	case first == tlsRecordHandshake:
 		tlsConn := tls.Server(newReplayConn(conn, br), tlsCfg)
 		if err := tlsConn.HandshakeContext(context.Background()); err != nil {
+			_ = conn.Close()
 			return
 		}
+		// The handshake is done, so the inner sniff gets a fresh deadline.
+		_ = tlsConn.SetReadDeadline(time.Now().Add(sniffTimeout))
 		inner := newPeekReader(tlsConn)
 		firstDecrypted, err := inner.peekByte()
 		if err != nil {
+			_ = conn.Close()
 			return
 		}
+		clearSniffDeadlines(tlsConn)
 		wrapped := newReplayConn(tlsConn, inner)
 		switch {
 		case firstDecrypted == socks5Greeting:
@@ -820,11 +889,19 @@ func (s *ProxyServer) dispatchMultiplex(conn net.Conn, tlsCfg *tls.Config, httpS
 		}
 
 	case isHTTPFirstByte(first):
+		clearSniffDeadlines(conn)
 		s.serveSingleHTTP(newReplayConn(conn, br), httpSrv)
 
 	default:
 		_ = conn.Close()
 	}
+}
+
+// clearSniffDeadlines removes the sniff deadline so the handler can impose its
+// own timeouts instead of inheriting this one.
+func clearSniffDeadlines(c net.Conn) {
+	_ = c.SetReadDeadline(time.Time{})
+	_ = c.SetWriteDeadline(time.Time{})
 }
 
 func isHTTPFirstByte(b byte) bool {
@@ -946,7 +1023,7 @@ func clientSession(local net.Conn, remoteURL, token string, insecure bool, keepa
 	defer local.Close()
 	tuneConn(local)
 
-	remote, cancel, err := dialTunnel(remoteURL, token, insecure, padding)
+	remote, wsConn, cancel, err := dialTunnel(remoteURL, token, insecure, padding)
 	if err != nil {
 		slog.Error("tunnel dial failed", "error", err)
 		return
@@ -978,7 +1055,7 @@ func clientSession(local net.Conn, remoteURL, token string, insecure bool, keepa
 	// that timeout is not configurable below Enterprise. A ping resets it.
 	stop := make(chan struct{})
 	defer close(stop)
-	go clientKeepalive(remote, keepalive, stop)
+	go clientKeepalive(wsConn, keepalive, stop)
 
 	<-done
 	// Tear the whole session down once either direction ends, so the surviving
@@ -994,7 +1071,7 @@ func clientSession(local net.Conn, remoteURL, token string, insecure bool, keepa
 // The returned context must stay alive for the life of the conn: NetConn derives
 // its read/write cancellation from it, so cancelling would sever the session.
 // Callers own cancelling it once the session ends.
-func dialTunnel(rawURL, token string, insecure bool, padding int) (net.Conn, context.CancelFunc, error) {
+func dialTunnel(rawURL, token string, insecure bool, padding int) (net.Conn, *websocket.Conn, context.CancelFunc, error) {
 	const (
 		dialTimeout  = 15 * time.Second
 		maxAttempts  = 5
@@ -1035,7 +1112,7 @@ func dialTunnel(rawURL, token string, insecure bool, padding int) (net.Conn, con
 			// NetConn derives its lifetime from sessionCtx, not the dial ctx, so
 			// the dial context can be released immediately on success.
 			dialCancel()
-			return conn, sessionCancel, nil
+			return conn, wsConn, sessionCancel, nil
 		}
 		dialCancel()
 		lastErr = err
@@ -1051,7 +1128,7 @@ func dialTunnel(rawURL, token string, insecure bool, padding int) (net.Conn, con
 		time.Sleep(wait)
 	}
 	sessionCancel()
-	return nil, nil, fmt.Errorf("after %d attempts: %w", maxAttempts, lastErr)
+	return nil, nil, nil, fmt.Errorf("after %d attempts: %w", maxAttempts, lastErr)
 }
 
 func authHeader(token string) http.Header {
@@ -1060,8 +1137,15 @@ func authHeader(token string) http.Header {
 	return h
 }
 
-func clientKeepalive(conn net.Conn, interval time.Duration, stop <-chan struct{}) {
-	if interval <= 0 {
+// clientKeepalive sends a real WebSocket control-frame ping.
+//
+// It must be a control frame, not an empty data write: padConn.Write discards
+// an empty slice, so a conn-level write would send nothing at all once padding
+// is on (which is the default) and the edge would still close the idle socket.
+// Control frames also count as activity for every intermediary's idle timer.
+// The pong is consumed by the concurrent read in io.Copy.
+func clientKeepalive(wsConn *websocket.Conn, interval time.Duration, stop <-chan struct{}) {
+	if wsConn == nil || interval <= 0 {
 		return
 	}
 	ticker := time.NewTicker(interval)
@@ -1071,9 +1155,13 @@ func clientKeepalive(conn net.Conn, interval time.Duration, stop <-chan struct{}
 		case <-stop:
 			return
 		case <-ticker.C:
-			// A zero-length write acts as an application-level ping. websocket.NetConn
-			// surfaces pings transparently; this keeps the edge-side timer reset.
-			_, _ = conn.Write(nil)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			err := wsConn.Ping(ctx)
+			cancel()
+			if err != nil {
+				slog.Debug("tunnel keepalive failed", "error", err)
+				return
+			}
 		}
 	}
 }

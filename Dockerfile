@@ -39,6 +39,8 @@ RUN apk add --no-cache ca-certificates wget \
 COPY --from=builder /out/socks5-proxy ./socks5-proxy
 COPY config.json .
 COPY web ./web
+# MIT requires the notice to travel with distributed copies.
+COPY LICENSE .
 
 # SQLite lives here. Created and owned up front so the non-root user can write.
 RUN mkdir -p /app/data && chown -R appuser:appgroup /app
@@ -56,9 +58,9 @@ USER appuser
 # opt into single-port mode (PaaS providers inject it automatically).
 EXPOSE 1080 8080 9090
 
-# /health is always reachable without admin credentials, and follows $PORT so it
-# stays correct in both modes.
+# /health is always reachable without admin credentials. The probe mirrors the
+# precedence in LoadConfig: SINGLE_PORT wins over PORT, which wins over 8080.
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
-    CMD wget -q --spider "http://localhost:${PORT:-8080}/health" || exit 1
+    CMD wget -q --spider "http://localhost:${SINGLE_PORT:-${PORT:-8080}}/health" || exit 1
 
 CMD ["./socks5-proxy", "config.json"]

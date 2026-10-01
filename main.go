@@ -110,12 +110,12 @@ func LoadConfig(filename string) (Config, error) {
 		return cfg, fmt.Errorf("parse config: %w", err)
 	}
 
-	// Environment variables override config file
-	if port := os.Getenv("PORT"); port != "" {
-		if p, err := strconv.Atoi(port); err == nil && p > 0 {
-			cfg.ProxyPort = p
-		}
-	}
+	// Environment variables override config file.
+	//
+	// PORT deliberately no longer maps to ProxyPort. On a PaaS it would collide
+	// with the single-port mux, which binds the same value, and the second
+	// listener would fail. PORT now means "serve everything on this one port"
+	// (see the SINGLE_PORT block below); use PROXY_PORT to move the SOCKS5 port.
 	if port := os.Getenv("PROXY_PORT"); port != "" {
 		if p, err := strconv.Atoi(port); err == nil && p > 0 {
 			cfg.ProxyPort = p
@@ -1689,12 +1689,25 @@ func runServer(logger *slog.Logger, configFile string) {
 		}
 	}
 
-	listener, err := net.Listen("tcp", proxyAddr)
-	if err != nil {
-		logger.Error("failed to start proxy listener", "error", err)
-		os.Exit(1)
+	// The mux already serves raw SOCKS5, so binding a second listener on the
+	// same port would fail. This happens whenever SinglePort equals ProxyPort,
+	// which is the default 1080/1080 case as well as the PORT-injected case.
+	muxServesSocks := singlePort && cfg.SinglePort == cfg.ProxyPort
+	if muxServesSocks {
+		logger.Info("proxy listener skipped: single-port mux already serves SOCKS5 on this port",
+			"port", cfg.SinglePort)
 	}
-	defer listener.Close()
+
+	var listener net.Listener
+	if !muxServesSocks {
+		var err error
+		listener, err = net.Listen("tcp", proxyAddr)
+		if err != nil {
+			logger.Error("failed to start proxy listener", "error", err)
+			os.Exit(1)
+		}
+		defer listener.Close()
+	}
 
 	// Periodic stats persistence (every 60 seconds)
 	go func() {
@@ -1755,38 +1768,42 @@ func runServer(logger *slog.Logger, configFile string) {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	go func() {
-		for {
-			conn, err := listener.Accept()
-			if err != nil {
-				select {
-				case <-server.shutdownCh:
-					return
-				default:
-					logger.Error("accept error", "error", err)
-					time.Sleep(100 * time.Millisecond)
+	if listener != nil {
+		go func() {
+			for {
+				conn, err := listener.Accept()
+				if err != nil {
+					select {
+					case <-server.shutdownCh:
+						return
+					default:
+						logger.Error("accept error", "error", err)
+						time.Sleep(100 * time.Millisecond)
+						continue
+					}
+				}
+
+				// Check connection limit (read under lock for dynamic updates)
+				server.configMu.RLock()
+				maxConns := server.cfg.MaxConns
+				server.configMu.RUnlock()
+				if server.activeConns.Load() >= int64(maxConns) {
+					logger.Warn("max connections reached, rejecting", "client", conn.RemoteAddr())
+					conn.Close()
 					continue
 				}
-			}
 
-			// Check connection limit (read under lock for dynamic updates)
-			server.configMu.RLock()
-			maxConns := server.cfg.MaxConns
-			server.configMu.RUnlock()
-			if server.activeConns.Load() >= int64(maxConns) {
-				logger.Warn("max connections reached, rejecting", "client", conn.RemoteAddr())
-				conn.Close()
-				continue
+				go server.handleClient(conn)
 			}
-
-			go server.handleClient(conn)
-		}
-	}()
+		}()
+	}
 
 	<-ctx.Done()
 	logger.Info("shutdown signal received, draining connections...")
 
-	listener.Close()
+	if listener != nil {
+		listener.Close()
+	}
 	close(server.shutdownCh)
 
 	httpCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
