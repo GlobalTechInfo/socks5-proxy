@@ -573,19 +573,6 @@ func (f *forwardProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 //
 // r.BasicAuth() is deliberately not used: it only reads the "Authorization"
 // header, and a forward proxy receives its credentials in "Proxy-Authorization".
-// requestIP extracts the peer address for an HTTP request. In single-port mode
-// this is always a real TCP peer, so the RemoteAddr is authoritative; the
-// bracketed form from SplitHostPort is stripped.
-func requestIP(r *http.Request) string {
-	if r == nil {
-		return "unknown"
-	}
-	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
-		return host
-	}
-	return r.RemoteAddr
-}
-
 func validProxyAuth(r *http.Request, wantUser, wantPass string) bool {
 	h := r.Header.Get("Proxy-Authorization")
 	const prefix = "Basic "
@@ -660,8 +647,9 @@ func (s *ProxyServer) tunnelHandler(w http.ResponseWriter, r *http.Request) {
 		conn = newPadConn(conn, cfg.TunnelPadding)
 	}
 
-	s.logger.Info("tunnel session opened", "remote", r.RemoteAddr, "padding", cfg.TunnelPadding)
-	s.handleClient(conn)
+	clientIP := requestIP(r)
+	s.logger.Info("tunnel session opened", "client", clientIP, "padding", cfg.TunnelPadding)
+	s.handleClient(conn, clientIP)
 }
 
 // cancelConn ties a context cancel to Close, so tearing down the SOCKS5 session
@@ -710,6 +698,29 @@ func (s *ProxyServer) currentConfig() Config {
 //	0x05           -> SOCKS5
 //	0x16           -> TLS ClientHello, then re-sniff the decrypted byte
 //	A-Z, "PRI"     -> HTTP request (PRI * = HTTP/2 cleartext preface)
+//
+// validateRoutePattern rejects a value that http.ServeMux cannot register.
+//
+// ServeMux panics rather than returning an error, so any pattern it rejects
+// would otherwise take the process down at startup:
+//
+//   - a pattern not starting with "/" panics with "host/path missing /"
+//   - ASCII space or tab panics with "invalid method", because Go 1.22+ splits
+//     patterns on whitespace to support the "METHOD /path" form
+//
+// Only ASCII space (0x20) and tab (0x09) are rejected. Unicode whitespace is
+// not a separator to ServeMux and is left alone, and the value is not trimmed:
+// a silently altered path would be harder to diagnose than a rejected one.
+func validateRoutePattern(name, pattern string) error {
+	if !strings.HasPrefix(pattern, "/") {
+		return fmt.Errorf("%s must start with %q, got %q", name, "/", pattern)
+	}
+	if strings.ContainsAny(pattern, " \t") {
+		return fmt.Errorf("%s must not contain spaces or tabs, got %q", name, pattern)
+	}
+	return nil
+}
+
 func (s *ProxyServer) serveMultiplex(addr string) error {
 	cfg := s.currentConfig()
 
@@ -727,12 +738,6 @@ func (s *ProxyServer) serveMultiplex(addr string) error {
 	tunnelPath := cfg.TunnelPath
 	if tunnelPath == "" {
 		tunnelPath = defaultTunnelPath
-	}
-	// http.ServeMux panics on a pattern that does not start with "/", so a
-	// missing slash would take the whole process down at startup. Fail with a
-	// usable message instead.
-	if !strings.HasPrefix(tunnelPath, "/") {
-		return fmt.Errorf("tunnel_path must start with %q, got %q", "/", tunnelPath)
 	}
 	// Tell the auth layer which path to skip (basicAuth reads this).
 	tunnelPublicPath = tunnelPath
@@ -755,7 +760,12 @@ func (s *ProxyServer) serveMultiplex(addr string) error {
 	tunnelMux := http.NewServeMux()
 	// Only advertise the tunnel when it is actually enabled, so a disabled
 	// tunnel does not answer 403 on a live path and looks absent to a prober.
+	// The route pattern is validated here rather than above, because a disabled
+	// tunnel registers nothing and so cannot be harmed by a malformed value.
 	if cfg.TunnelEnabled {
+		if err := validateRoutePattern("tunnel_path", tunnelPath); err != nil {
+			return err
+		}
 		tunnelMux.HandleFunc(tunnelPath, s.tunnelHandler)
 	}
 	tunnelMux.HandleFunc("/tls-cert", s.tlsCertHandler(tlsCfg))
@@ -867,7 +877,7 @@ func (s *ProxyServer) dispatchMultiplex(conn net.Conn, tlsCfg *tls.Config, httpS
 	switch {
 	case first == socks5Greeting:
 		clearSniffDeadlines(conn)
-		s.handleClient(newReplayConn(conn, br))
+		s.handleClient(newReplayConn(conn, br), remoteIP(conn))
 
 	case first == tlsRecordHandshake:
 		tlsConn := tls.Server(newReplayConn(conn, br), tlsCfg)
@@ -887,7 +897,7 @@ func (s *ProxyServer) dispatchMultiplex(conn net.Conn, tlsCfg *tls.Config, httpS
 		wrapped := newReplayConn(tlsConn, inner)
 		switch {
 		case firstDecrypted == socks5Greeting:
-			s.handleClient(wrapped)
+			s.handleClient(wrapped, remoteIP(tlsConn))
 		case isHTTPFirstByte(firstDecrypted):
 			s.serveSingleHTTP(wrapped, httpSrv)
 		default:

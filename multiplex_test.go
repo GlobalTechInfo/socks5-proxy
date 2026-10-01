@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -1087,24 +1088,117 @@ func TestSniffTimeoutClosesSilentConnection(t *testing.T) {
 	t.Fatal("server sent data on a silent connection")
 }
 
-// ─── Test 21: a bad TUNNEL_PATH must not panic ────────────────────────────
+// ─── Test 21: bad TUNNEL_PATH values must not panic ────────────────────────
 
-// http.ServeMux panics on a pattern without a leading slash, which took the
-// whole process down at startup. It must be a clear configuration error.
-func TestTunnelPathMustStartWithSlash(t *testing.T) {
+// http.ServeMux panics rather than returning an error, so every value it would
+// reject has to be caught before registration. That includes ASCII space and
+// tab, which Go 1.22+ splits on to support the "METHOD /path" form.
+func TestTunnelPathRejectsServeMuxPanics(t *testing.T) {
+	bad := map[string]string{
+		"no leading slash": "tunnel",
+		"trailing space":   "/tunnel ",
+		"trailing tab":     "/tunnel\t",
+		"inner space":      "/tun nel",
+		"method prefix":    "GET /tunnel",
+	}
+	for name, path := range bad {
+		t.Run(name, func(t *testing.T) {
+			srv := NewProxyServer(DefaultConfig())
+			srv.tunnelLimiter = newRateLimiter(5)
+			srv.cfg.TunnelEnabled = true
+			srv.cfg.TunnelPath = path
+
+			err := srv.serveMultiplex("127.0.0.1:0")
+			if err == nil {
+				t.Fatalf("serveMultiplex accepted %q", path)
+			}
+			if !strings.Contains(err.Error(), "tunnel_path") {
+				t.Fatalf("error %q should name tunnel_path", err)
+			}
+		})
+	}
+
+	// A valid path must still start.
 	srv := NewProxyServer(DefaultConfig())
 	srv.tunnelLimiter = newRateLimiter(5)
-
-	tlsCfg, err := buildTLSConfig(DefaultConfig())
-	if err != nil {
-		t.Fatalf("buildTLSConfig: %v", err)
+	srv.cfg.TunnelEnabled = true
+	srv.cfg.TunnelPath = "/api/v1/tunnel"
+	if err := srv.serveMultiplex("127.0.0.1:0"); err != nil {
+		t.Fatalf("valid tunnel path rejected: %v", err)
 	}
+}
 
-	srv.cfg.TunnelPath = "tunnel" // no leading slash
-	if err := srv.serveMultiplex("127.0.0.1:0"); err == nil {
-		t.Fatal("serveMultiplex accepted a tunnel path without a leading slash")
-	} else if !strings.Contains(err.Error(), "tunnel_path") {
-		t.Fatalf("error %q should name tunnel_path", err)
+// A disabled tunnel registers nothing, so a malformed path is harmless and must
+// not block startup. Validating unconditionally broke deployments that set
+// TUNNEL_ENABLED=false while leaving a stale TUNNEL_PATH behind.
+func TestDisabledTunnelIgnoresPath(t *testing.T) {
+	srv := NewProxyServer(DefaultConfig())
+	srv.tunnelLimiter = newRateLimiter(5)
+	srv.cfg.TunnelEnabled = false
+	srv.cfg.TunnelPath = "not-even-a-path"
+
+	if err := srv.serveMultiplex("127.0.0.1:0"); err != nil {
+		t.Fatalf("disabled tunnel rejected a path it never registers: %v", err)
 	}
-	_ = tlsCfg
+}
+
+// Unicode whitespace is not a ServeMux separator and must not be rejected.
+func TestRoutePatternAllowsUnicodeWhitespace(t *testing.T) {
+	if err := validateRoutePattern("tunnel_path", "/tunnel\u00a0"); err != nil {
+		t.Fatalf("unicode whitespace rejected: %v", err)
+	}
+}
+
+func TestRequestIPPrefersForwardedFor(t *testing.T) {
+	cases := []struct {
+		name   string
+		header string
+		remote string
+		want   string
+	}{
+		{"single hop", "203.0.113.7", "10.60.0.1:1234", "203.0.113.7"},
+		{"left-most of chain", "203.0.113.7, 70.41.3.18, 10.60.0.1", "10.60.0.1:1234", "203.0.113.7"},
+		{"padded entry", "  203.0.113.7  ", "10.60.0.1:1234", "203.0.113.7"},
+		{"absent falls back to peer", "", "198.51.100.9:5555", "198.51.100.9"},
+		{"empty entry falls back", "   ", "198.51.100.9:5555", "198.51.100.9"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := httptest.NewRequest(http.MethodGet, "/", nil)
+			r.RemoteAddr = tc.remote
+			if tc.header != "" {
+				r.Header.Set("X-Forwarded-For", tc.header)
+			}
+			if got := requestIP(r); got != tc.want {
+				t.Fatalf("requestIP = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestRemoteIPIgnoresAddrType(t *testing.T) {
+	// Tunnel sessions arrive as non-TCP conns; this must not panic on them.
+	if got := remoteIP(nil); got != "unknown" {
+		t.Fatalf("remoteIP(nil) = %q, want unknown", got)
+	}
+	c, srv := net.Pipe()
+	defer c.Close()
+	defer srv.Close()
+	if got := remoteIP(c); got == "" {
+		t.Fatal("remoteIP returned empty for live conn")
+	}
+}
+
+func TestIsClientDisconnectClassifiesHandshakeNoise(t *testing.T) {
+	for _, err := range []error{io.EOF, net.ErrClosed, errors.New("read: connection reset by peer"), errors.New("write: broken pipe")} {
+		if !isClientDisconnect(err) {
+			t.Fatalf("isClientDisconnect(%v) = false, want true", err)
+		}
+	}
+	if isClientDisconnect(errors.New("socks auth method negotiation failed")) {
+		t.Fatal("real protocol error misclassified as client disconnect")
+	}
+	if isClientDisconnect(nil) {
+		t.Fatal("nil misclassified as client disconnect")
+	}
 }
