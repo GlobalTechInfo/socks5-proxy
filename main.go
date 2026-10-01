@@ -26,6 +26,10 @@ import (
 
 // ─── Configuration ─────────────────────────────────────────────────────────
 
+// version is reported by the version subcommand, /health and /api/stats, so the
+// three can never disagree.
+const version = "1.2.0"
+
 type Config struct {
 	ProxyPort    int      `json:"proxy_port"`
 	AdminPort    int      `json:"admin_port"`
@@ -51,22 +55,47 @@ type Config struct {
 	// Rate limiting (admin endpoints)
 	RateLimitEnabled bool `json:"rate_limit_enabled"`
 	RateLimitRPS     int  `json:"rate_limit_rps"`
+
+	// Single-port multiplex mode.
+	// When unset, the server binds proxy_port/admin_port/metrics_port separately.
+	// When set, everything shares this one port (see multiplex.go), which is what
+	// PaaS platforms that expose a single HTTP endpoint require.
+	SinglePort int `json:"single_port,omitempty"`
+
+	// WebSocket tunnel, for platforms where raw TCP never reaches the app
+	// (Render, Koyeb, Northflank: their edge terminates TLS and speaks HTTP only).
+	TunnelEnabled bool   `json:"tunnel_enabled"`
+	TunnelToken   string `json:"tunnel_token"`
+	TunnelPath    string `json:"tunnel_path"`
+	TunnelPadding int    `json:"tunnel_padding"`
+	TunnelRateRPS int    `json:"tunnel_rate_limit_rps"`
+
+	// TLS for the raw SOCKS5 port. Both empty means self-signed cert is
+	// generated in memory at startup.
+	TLSCertFile string `json:"tls_cert_file"`
+	TLSKeyFile  string `json:"tls_key_file"`
 }
 
 func DefaultConfig() Config {
 	return Config{
-		ProxyPort:              1080,
-		AdminPort:              8080,
-		MetricsPort:            9090,
-		MaxConns:               1000,
-		AuthEnabled:            true,
-		ReadTimeout:            30,
-		WriteTimeout:           30,
-		IdleTimeout:            120,
+		ProxyPort:    1080,
+		AdminPort:    8080,
+		MetricsPort:  9090,
+		MaxConns:     1000,
+		AuthEnabled:  true,
+		ReadTimeout:  30,
+		WriteTimeout: 30,
+		// IdleTimeout is the deadline on an established proxy session. 120s
+		// drops idle chat connections that are otherwise healthy, so the
+		// default is generous; raise it further for long-lived clients.
+		IdleTimeout:            300,
 		AdminEnabled:           true,
 		SecurityHeadersEnabled: true,
 		RateLimitEnabled:       true,
 		RateLimitRPS:           30,
+		TunnelPath:             "/api/v1/tunnel",
+		TunnelPadding:          256,
+		TunnelRateRPS:          5,
 	}
 }
 
@@ -114,6 +143,10 @@ func LoadConfig(filename string) (Config, error) {
 		}
 	}
 
+	if v := os.Getenv("AUTH_ENABLED"); v != "" {
+		cfg.AuthEnabled = v == "true" || v == "1"
+	}
+
 	// Admin auth env vars
 	if user := os.Getenv("ADMIN_USER"); user != "" {
 		cfg.AdminUser = user
@@ -136,7 +169,109 @@ func LoadConfig(filename string) (Config, error) {
 		}
 	}
 
+	// Session timeouts. IDLE_TIMEOUT_SECONDS matters most on a proxy: it is the
+	// deadline applied to an established SOCKS5 session, so a value below the
+	// interval at which your apps send keepalives will drop idle connections.
+	if v := os.Getenv("READ_TIMEOUT_SECONDS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			cfg.ReadTimeout = n
+		}
+	}
+	if v := os.Getenv("WRITE_TIMEOUT_SECONDS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			cfg.WriteTimeout = n
+		}
+	}
+	if v := os.Getenv("IDLE_TIMEOUT_SECONDS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			cfg.IdleTimeout = n
+		}
+	}
+
+	// Single-port mux mode.
+	//
+	// PORT is checked first because Render, Koyeb and Heroku inject it
+	// automatically. Northflank declares ports explicitly and does not inject
+	// PORT, so SINGLE_PORT is the explicit escape hatch for it. When neither is
+	// set the server binds its three traditional ports, unchanged.
+	if p := os.Getenv("SINGLE_PORT"); p != "" {
+		if v, err := strconv.Atoi(p); err == nil && v > 0 {
+			cfg.SinglePort = v
+		}
+	} else if p := os.Getenv("PORT"); p != "" {
+		if v, err := strconv.Atoi(p); err == nil && v > 0 {
+			cfg.SinglePort = v
+		}
+	}
+
+	// Tunnel + TLS
+	if v := os.Getenv("TUNNEL_ENABLED"); v != "" {
+		cfg.TunnelEnabled = v == "true" || v == "1"
+	}
+	if v := os.Getenv("TUNNEL_TOKEN"); v != "" {
+		cfg.TunnelToken = v
+	}
+	if v := os.Getenv("TUNNEL_PATH"); v != "" {
+		cfg.TunnelPath = v
+	}
+	if v := os.Getenv("TUNNEL_PADDING"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			cfg.TunnelPadding = n
+		}
+	}
+	if v := os.Getenv("TUNNEL_RATE_LIMIT_RPS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			cfg.TunnelRateRPS = n
+		}
+	}
+	if v := os.Getenv("TLS_CERT_FILE"); v != "" {
+		cfg.TLSCertFile = v
+	}
+	if v := os.Getenv("TLS_KEY_FILE"); v != "" {
+		cfg.TLSKeyFile = v
+	}
+
 	return cfg, nil
+}
+
+// remoteIP extracts the client IP from a connection. Tunnel sessions arrive as
+// non-TCP conns (WebSocket-backed), so the *net.TCPAddr assertion that used to
+// be here would panic on them.
+func remoteIP(conn net.Conn) string {
+	if conn == nil {
+		return "unknown"
+	}
+	addr := conn.RemoteAddr()
+	if addr == nil {
+		return "unknown"
+	}
+	if ta, ok := addr.(*net.TCPAddr); ok {
+		return ta.IP.String()
+	}
+	if host, _, err := net.SplitHostPort(addr.String()); err == nil {
+		return host
+	}
+	return addr.String()
+}
+
+// tuneConn applies throughput/latency tuning to an accepted TCP connection.
+//
+// Socket buffers: Go's default ~64KB receive window caps a long-RTT link at
+// roughly 64KB/RTT (~3Mbps at 160ms) regardless of how fast the local
+// connection is. 4MB lifts that ceiling by orders of magnitude on high-latency
+// routes, which is the common case for clients reaching a EU/US region.
+//
+// NoDelay: the relay copies below use io.Copy, which does not disable Nagle.
+// On a low-RTT path that silently adds up to 40ms per small write.
+func tuneConn(conn net.Conn) {
+	tcp, ok := conn.(*net.TCPConn)
+	if !ok {
+		return
+	}
+	const bufSize = 4 << 20 // 4MB
+	_ = tcp.SetReadBuffer(bufSize)
+	_ = tcp.SetWriteBuffer(bufSize)
+	_ = tcp.SetNoDelay(true)
 }
 
 // ─── SOCKS5 Protocol Constants ─────────────────────────────────────────────
@@ -156,15 +291,15 @@ const (
 	addrTypeFQDN = 0x03
 	addrTypeIPv6 = 0x04
 
-	replySucceeded         = 0x00
-	replyGeneralFailure    = 0x01
-	replyConnNotAllowed    = 0x02
+	replySucceeded          = 0x00
+	replyGeneralFailure     = 0x01
+	replyConnNotAllowed     = 0x02
 	replyNetworkUnreachable = 0x03
-	replyHostUnreachable   = 0x04
-	replyConnRefused       = 0x05
-	replyTTLExpired        = 0x06
-	replyCmdNotSupported   = 0x07
-	replyAddrNotSupported  = 0x08
+	replyHostUnreachable    = 0x04
+	replyConnRefused        = 0x05
+	replyTTLExpired         = 0x06
+	replyCmdNotSupported    = 0x07
+	replyAddrNotSupported   = 0x08
 
 	authStatusSuccess = 0x00
 	authStatusFailure = 0x01
@@ -214,13 +349,13 @@ func init() {
 // ─── Stats (for admin API) ─────────────────────────────────────────────────
 
 type Stats struct {
-	ActiveConns     int64             `json:"active_connections"`
-	TotalConns      int64             `json:"total_connections"`
-	AuthFailures    int64             `json:"auth_failures"`
-	BlockedConns    int64             `json:"blocked_connections"`
-	TopDestinations map[string]int64  `json:"top_destinations"`
-	Uptime          string            `json:"uptime"`
-	Version         string            `json:"version"`
+	ActiveConns     int64            `json:"active_connections"`
+	TotalConns      int64            `json:"total_connections"`
+	AuthFailures    int64            `json:"auth_failures"`
+	BlockedConns    int64            `json:"blocked_connections"`
+	TopDestinations map[string]int64 `json:"top_destinations"`
+	Uptime          string           `json:"uptime"`
+	Version         string           `json:"version"`
 }
 
 type ProxyServer struct {
@@ -234,16 +369,25 @@ type ProxyServer struct {
 	blockedConns atomic.Int64
 
 	// Destination tracking
-	destMu   sync.RWMutex
-	dests    map[string]int64
+	destMu sync.RWMutex
+	dests  map[string]int64
 
 	// Connection tracking for graceful shutdown
-	connMu   sync.Mutex
-	conns    map[net.Conn]struct{}
-	wg       sync.WaitGroup
+	connMu sync.Mutex
+	conns  map[net.Conn]struct{}
+	wg     sync.WaitGroup
 
 	// Rate limiter (shared reference for runtime updates)
 	limiter *rateLimiter
+
+	// Separate limiter for tunnel handshakes, so token brute-force cannot
+	// exhaust the admin/dashboard budget (see multiplex.go)
+	tunnelLimiter *rateLimiter
+
+	// Client used for absolute-URI forward-proxy requests (http:// targets).
+	// Initialised with the mux; nil in multi-port mode, where forward proxying
+	// is not exposed.
+	proxyTransport *http.Transport
 
 	// Persistence
 	store *Store
@@ -255,11 +399,11 @@ type ProxyServer struct {
 
 func NewProxyServer(cfg Config) *ProxyServer {
 	return &ProxyServer{
-		cfg:       cfg,
-		logger:    slog.Default(),
-		startTime: time.Now(),
-		dests:     make(map[string]int64),
-		conns:     make(map[net.Conn]struct{}),
+		cfg:        cfg,
+		logger:     slog.Default(),
+		startTime:  time.Now(),
+		dests:      make(map[string]int64),
+		conns:      make(map[net.Conn]struct{}),
 		shutdownCh: make(chan struct{}),
 	}
 }
@@ -345,7 +489,7 @@ func (s *ProxyServer) Stats() Stats {
 		BlockedConns:    s.blockedConns.Load(),
 		TopDestinations: topDests,
 		Uptime:          time.Since(s.startTime).Truncate(time.Second).String(),
-		Version:         "1.1.0",
+		Version:         version,
 	}
 }
 
@@ -358,7 +502,7 @@ func (s *ProxyServer) handleClient(conn net.Conn) {
 	s.trackConn(conn)
 	defer s.untrackConn(conn)
 
-	clientIP := conn.RemoteAddr().(*net.TCPAddr).IP.String()
+	clientIP := remoteIP(conn)
 	log := s.logger.With("client", clientIP)
 
 	// Snapshot config under lock for this connection's lifetime
@@ -762,10 +906,29 @@ func securityHeaders(next http.Handler) http.Handler {
 	})
 }
 
+// publicPaths are reachable without admin credentials. /health is for load
+// balancers; the rest are metrics mux routes and the certificate endpoint,
+// which are not sensitive. The tunnel path is added at startup because it is
+// configurable, and authenticates via its own token.
+var publicPaths = map[string]bool{
+	"/health":     true,
+	"/metrics":    true,
+	"/prometheus": true,
+	"/api/live":   true,
+	"/tls-cert":   true,
+}
+
+// tunnelPublicPath records the configured tunnel path so basicAuth can skip it.
+var tunnelPublicPath = defaultTunnelPath
+
+func isPublicPath(path string) bool {
+	return publicPaths[path] || path == tunnelPublicPath
+}
+
 func basicAuth(user, pass string) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if r.URL.Path == "/health" {
+			if isPublicPath(r.URL.Path) {
 				next.ServeHTTP(w, r)
 				return
 			}
@@ -864,6 +1027,54 @@ func noDirListing(root http.FileSystem) http.Handler {
 // ─── HTTP Servers (Admin + Metrics) ────────────────────────────────────────
 
 func (s *ProxyServer) startAdminServer(addr string) *http.Server {
+	handler := s.adminHandler()
+
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           handler,
+		ReadTimeout:       5 * time.Second,
+		WriteTimeout:      5 * time.Second,
+		IdleTimeout:       30 * time.Second,
+		ReadHeaderTimeout: 3 * time.Second,
+		MaxHeaderBytes:    8192,
+	}
+
+	go func() {
+		s.logger.Info("admin server started", "addr", addr)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			s.logger.Error("admin server error", "error", err)
+		}
+	}()
+
+	return srv
+}
+
+func (s *ProxyServer) startMetricsServer(addr string) *http.Server {
+	handler := s.metricsHandler()
+
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           handler,
+		ReadTimeout:       5 * time.Second,
+		WriteTimeout:      5 * time.Second,
+		IdleTimeout:       30 * time.Second,
+		ReadHeaderTimeout: 3 * time.Second,
+		MaxHeaderBytes:    8192,
+	}
+
+	go func() {
+		s.logger.Info("metrics dashboard started", "addr", addr)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			s.logger.Error("metrics server error", "error", err)
+		}
+	}()
+
+	return srv
+}
+
+// adminHandler builds the admin/dashboard handler chain. Extracted so the
+// single-port mux can mount it without binding its own listener.
+func (s *ProxyServer) adminHandler() http.Handler {
 	mux := http.NewServeMux()
 
 	// /health is always open (for load balancers / probes)
@@ -873,7 +1084,7 @@ func (s *ProxyServer) startAdminServer(addr string) *http.Server {
 		json.NewEncoder(w).Encode(map[string]string{
 			"status":  "ok",
 			"uptime":  time.Since(s.startTime).Truncate(time.Second).String(),
-			"version": "1.1.0",
+			"version": version,
 		})
 	})
 
@@ -909,14 +1120,14 @@ func (s *ProxyServer) startAdminServer(addr string) *http.Server {
 			s.configMu.RUnlock()
 
 			type safeConfig struct {
-				MaxConnections        int    `json:"max_connections"`
-				ProxyUser             string `json:"proxy_user"`
-				ProxyPassHidden       string `json:"proxy_pass"`
-				AuthEnabled           bool   `json:"auth_enabled"`
-				AdminAuthEnabled      bool   `json:"admin_auth_enabled"`
-				SecurityHeadersEnabled bool  `json:"security_headers_enabled"`
-				RateLimitEnabled      bool   `json:"rate_limit_enabled"`
-				RateLimitRPS          int    `json:"rate_limit_rps"`
+				MaxConnections         int    `json:"max_connections"`
+				ProxyUser              string `json:"proxy_user"`
+				ProxyPassHidden        string `json:"proxy_pass"`
+				AuthEnabled            bool   `json:"auth_enabled"`
+				AdminAuthEnabled       bool   `json:"admin_auth_enabled"`
+				SecurityHeadersEnabled bool   `json:"security_headers_enabled"`
+				RateLimitEnabled       bool   `json:"rate_limit_enabled"`
+				RateLimitRPS           int    `json:"rate_limit_rps"`
 			}
 			masked := "****"
 			if cfg.Password == "" {
@@ -1001,13 +1212,13 @@ func (s *ProxyServer) startAdminServer(addr string) *http.Server {
 		if s.store != nil {
 			batch := map[string]string{
 				"max_connections":          fmt.Sprintf("%d", newCfg.MaxConns),
-				"proxy_user":              newCfg.Username,
-				"auth_enabled":            fmt.Sprintf("%v", newCfg.AuthEnabled),
-				"admin_auth_enabled":      fmt.Sprintf("%v", newCfg.AdminEnabled),
-				"admin_username":          newCfg.AdminUser,
+				"proxy_user":               newCfg.Username,
+				"auth_enabled":             fmt.Sprintf("%v", newCfg.AuthEnabled),
+				"admin_auth_enabled":       fmt.Sprintf("%v", newCfg.AdminEnabled),
+				"admin_username":           newCfg.AdminUser,
 				"security_headers_enabled": fmt.Sprintf("%v", newCfg.SecurityHeadersEnabled),
-				"rate_limit_enabled":      fmt.Sprintf("%v", newCfg.RateLimitEnabled),
-				"rate_limit_rps":          fmt.Sprintf("%d", newCfg.RateLimitRPS),
+				"rate_limit_enabled":       fmt.Sprintf("%v", newCfg.RateLimitEnabled),
+				"rate_limit_rps":           fmt.Sprintf("%d", newCfg.RateLimitRPS),
 			}
 			if patch.ProxyPass != nil && *patch.ProxyPass != "" && *patch.ProxyPass != "****" {
 				batch["proxy_pass"] = newCfg.Password
@@ -1232,6 +1443,8 @@ func (s *ProxyServer) startAdminServer(addr string) *http.Server {
 		http.ServeFile(w, r, "web/chart.min.js")
 	})
 
+	// tunnelPath is registered on its own mux in multiplex.go; serving the
+	// dashboard for it here would shadow the tunnel on the merged port.
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
 			http.NotFound(w, r)
@@ -1254,27 +1467,11 @@ func (s *ProxyServer) startAdminServer(addr string) *http.Server {
 		handler = securityHeaders(handler)
 	}
 
-	srv := &http.Server{
-		Addr:              addr,
-		Handler:           handler,
-		ReadTimeout:       5 * time.Second,
-		WriteTimeout:      5 * time.Second,
-		IdleTimeout:       30 * time.Second,
-		ReadHeaderTimeout: 3 * time.Second,
-		MaxHeaderBytes:    8192,
-	}
-
-	go func() {
-		s.logger.Info("admin server started", "addr", addr)
-		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			s.logger.Error("admin server error", "error", err)
-		}
-	}()
-
-	return srv
+	return handler
 }
 
-func (s *ProxyServer) startMetricsServer(addr string) *http.Server {
+// metricsHandler builds the metrics/Prometheus handler chain.
+func (s *ProxyServer) metricsHandler() http.Handler {
 	mux := http.NewServeMux()
 
 	// Prometheus endpoint
@@ -1286,9 +1483,9 @@ func (s *ProxyServer) startMetricsServer(addr string) *http.Server {
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"active_connections": s.activeConns.Load(),
 			"total_connections":  s.totalConns.Load(),
-			"auth_failures":     s.authFailures.Load(),
-			"blocked_conns":     s.blockedConns.Load(),
-			"uptime_seconds":    int(time.Since(s.startTime).Seconds()),
+			"auth_failures":      s.authFailures.Load(),
+			"blocked_conns":      s.blockedConns.Load(),
+			"uptime_seconds":     int(time.Since(s.startTime).Seconds()),
 		})
 	})
 
@@ -1365,24 +1562,7 @@ func (s *ProxyServer) startMetricsServer(addr string) *http.Server {
 		handler = securityHeaders(handler)
 	}
 
-	srv := &http.Server{
-		Addr:              addr,
-		Handler:           handler,
-		ReadTimeout:       5 * time.Second,
-		WriteTimeout:      5 * time.Second,
-		IdleTimeout:       30 * time.Second,
-		ReadHeaderTimeout: 3 * time.Second,
-		MaxHeaderBytes:    8192,
-	}
-
-	go func() {
-		s.logger.Info("metrics dashboard started", "addr", addr)
-		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			s.logger.Error("metrics server error", "error", err)
-		}
-	}()
-
-	return srv
+	return handler
 }
 
 // ─── Main ──────────────────────────────────────────────────────────────────
@@ -1393,10 +1573,37 @@ func main() {
 	}))
 	slog.SetDefault(logger)
 
-	configFile := "config.json"
+	// Subcommands. Bare invocation and "<file>" stay server-mode so existing
+	// deploys and scripts are unaffected.
 	if len(os.Args) > 1 {
-		configFile = os.Args[1]
+		switch os.Args[1] {
+		case "client":
+			if err := runClient(os.Args[2:]); err != nil {
+				logger.Error("client failed", "error", err)
+				os.Exit(1)
+			}
+			return
+		case "server":
+			runServer(logger, configArg(2))
+			return
+		case "version":
+			fmt.Printf("socks5-proxy %s\n", version)
+			return
+		}
 	}
+	runServer(logger, configArg(1))
+}
+
+// configArg returns the config file path from the given argv index, falling back
+// to the default name when absent.
+func configArg(i int) string {
+	if len(os.Args) > i && os.Args[i] != "" {
+		return os.Args[i]
+	}
+	return "config.json"
+}
+
+func runServer(logger *slog.Logger, configFile string) {
 
 	cfg, err := LoadConfig(configFile)
 	if err != nil {
@@ -1455,13 +1662,33 @@ func main() {
 	server := NewProxyServer(cfg)
 	server.store = store
 
+	// A tunnel without a token would be an open proxy. This repo is public and
+	// forked, so refuse rather than default to unauthenticated.
+	if cfg.TunnelEnabled && cfg.TunnelToken == "" {
+		logger.Error("tunnel_enabled requires tunnel_token; refusing to start an open proxy")
+		os.Exit(1)
+	}
+
 	adminAddr := fmt.Sprintf(":%d", cfg.AdminPort)
-	adminSrv := server.startAdminServer(adminAddr)
-
 	metricsAddr := fmt.Sprintf(":%d", cfg.MetricsPort)
-	metricsSrv := server.startMetricsServer(metricsAddr)
-
 	proxyAddr := fmt.Sprintf(":%d", cfg.ProxyPort)
+
+	// Multi-port mode (VPS, or any host with unfiltered TCP): unchanged from
+	// the original layout.
+	singlePort := cfg.SinglePort > 0
+
+	var adminSrv, metricsSrv *http.Server
+	if !singlePort {
+		adminSrv = server.startAdminServer(adminAddr)
+		metricsSrv = server.startMetricsServer(metricsAddr)
+	} else {
+		muxAddr := fmt.Sprintf(":%d", cfg.SinglePort)
+		if err := server.serveMultiplex(muxAddr); err != nil {
+			logger.Error("failed to start single-port mux", "error", err, "addr", muxAddr)
+			os.Exit(1)
+		}
+	}
+
 	listener, err := net.Listen("tcp", proxyAddr)
 	if err != nil {
 		logger.Error("failed to start proxy listener", "error", err)
@@ -1516,11 +1743,13 @@ func main() {
 		"proxy", proxyAddr,
 		"admin", adminAddr,
 		"metrics", metricsAddr,
+		"single_port", cfg.SinglePort,
 		"auth", cfg.AuthEnabled,
 		"admin_auth", cfg.AdminEnabled,
 		"security_headers", cfg.SecurityHeadersEnabled,
 		"rate_limit", cfg.RateLimitEnabled,
 		"max_conns", cfg.MaxConns,
+		"tunnel", cfg.TunnelEnabled,
 	)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -1563,8 +1792,12 @@ func main() {
 	httpCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	adminSrv.Shutdown(httpCtx)
-	metricsSrv.Shutdown(httpCtx)
+	if adminSrv != nil {
+		adminSrv.Shutdown(httpCtx)
+	}
+	if metricsSrv != nil {
+		metricsSrv.Shutdown(httpCtx)
+	}
 
 	done := make(chan struct{})
 	go func() {

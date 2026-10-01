@@ -1,9 +1,44 @@
+# Keep the build context small and free of local state. Anything excluded here
+# never reaches the daemon, so local secrets cannot leak into an image layer.
+
+# VCS and CI
 .git
+.gitignore
 .github
+
+# Secrets and local config
 .env
-README.md
-docker-compose*
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+creds.txt
+
+# Local runtime data: the SQLite database must never be baked into an image.
+data/*
+!data/.gitkeep
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+
+# Build output, so a stale local binary cannot shadow a fresh build
+socks5-proxy
+socks5-enterprise
+*.exe
+*.test
+*.out
+
+# Docs and compose files are not needed at runtime
 *.md
 LICENSE
+docker-compose*.yml
+docker-compose*.yaml
+compose*.yml
+
+# Tooling
 .vscode
 .idea
+Dockerfile
+.dockerignore

@@ -1,0 +1,50 @@
+services:
+  socks5-proxy:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: socks5-proxy:latest
+    container_name: socks5-proxy
+    restart: unless-stopped
+
+    # Multi-port layout: raw SOCKS5 plus the dashboards.
+    ports:
+      - "1080:1080"
+      - "8080:8080"
+      - "9090:9090"
+
+    # Single-port layout for PaaS-style hosting. Uncomment to serve the HTTP
+    # proxy, the dashboards and the WebSocket tunnel on one port only:
+    # ports:
+    #   - "8080:8080"
+    # environment:
+    #   - PORT=8080
+    #   - TUNNEL_ENABLED=true
+    #   - TUNNEL_TOKEN=${TUNNEL_TOKEN:?set TUNNEL_TOKEN in .env}
+
+    env_file:
+      - path: .env
+        required: false
+
+    # SQLite lives on a named volume so data survives rebuilds.
+    volumes:
+      - socks5-data:/app/data
+
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+
+    security_opt:
+      - no-new-privileges:true
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  socks5-data:

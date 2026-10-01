@@ -6,6 +6,8 @@ import (
 	"encoding/hex"
 	"fmt"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -19,6 +21,15 @@ type Store struct {
 }
 
 func NewStore(dbPath string, logger *slog.Logger) (*Store, error) {
+	// Create the parent directory. Without this a fresh checkout, or any
+	// container start with an empty /app/data, fails to boot on the first
+	// Open rather than on first write.
+	if dir := filepath.Dir(dbPath); dir != "" && dir != "." {
+		if err := os.MkdirAll(dir, 0o750); err != nil {
+			return nil, fmt.Errorf("create data dir %s: %w", dir, err)
+		}
+	}
+
 	db, err := sql.Open("sqlite", dbPath+"?_journal_mode=WAL&_busy_timeout=5000&_synchronous=NORMAL&_foreign_keys=ON")
 	if err != nil {
 		return nil, fmt.Errorf("open database: %w", err)
@@ -168,11 +179,11 @@ func (s *Store) SaveStatsSnapshot(active, total, authFails, blocked int64) error
 }
 
 type StatsSnapshot struct {
-	ActiveConns    int64     `json:"active_connections"`
-	TotalConns     int64     `json:"total_connections"`
-	AuthFailures   int64     `json:"auth_failures"`
-	BlockedConns   int64     `json:"blocked_connections"`
-	RecordedAt     time.Time `json:"recorded_at"`
+	ActiveConns  int64     `json:"active_connections"`
+	TotalConns   int64     `json:"total_connections"`
+	AuthFailures int64     `json:"auth_failures"`
+	BlockedConns int64     `json:"blocked_connections"`
+	RecordedAt   time.Time `json:"recorded_at"`
 }
 
 func (s *Store) GetStatsHistory(limit int) ([]StatsSnapshot, error) {
@@ -305,11 +316,11 @@ func (s *Store) Cleanup(olderThanDays int) error {
 // ─── Tier Definitions ──────────────────────────────────────────────────────
 
 type Tier struct {
-	Name            string `json:"name"`
-	MaxConnections  int    `json:"max_connections"`
-	BandwidthMbps   int    `json:"bandwidth_mbps"`
-	DataLimitBytes  int64  `json:"data_limit_bytes"`
-	DaysExpiry      int    `json:"days_expiry"`
+	Name           string `json:"name"`
+	MaxConnections int    `json:"max_connections"`
+	BandwidthMbps  int    `json:"bandwidth_mbps"`
+	DataLimitBytes int64  `json:"data_limit_bytes"`
+	DaysExpiry     int    `json:"days_expiry"`
 }
 
 var Tiers = map[string]Tier{
@@ -317,26 +328,26 @@ var Tiers = map[string]Tier{
 		Name:           "free",
 		MaxConnections: 1,
 		BandwidthMbps:  1,
-		DataLimitBytes: 1073741824,   // 1 GB
+		DataLimitBytes: 1073741824, // 1 GB
 		DaysExpiry:     7,
 	},
 	"basic": {
 		Name:           "basic",
 		MaxConnections: 5,
 		BandwidthMbps:  5,
-		DataLimitBytes: 53687091200,  // 50 GB
+		DataLimitBytes: 53687091200, // 50 GB
 		DaysExpiry:     30,
 	},
 	"pro": {
 		Name:           "pro",
 		MaxConnections: 20,
 		BandwidthMbps:  50,
-		DataLimitBytes: -1,           // unlimited
+		DataLimitBytes: -1, // unlimited
 		DaysExpiry:     90,
 	},
 	"unlimited": {
 		Name:           "unlimited",
-		MaxConnections: -1,           // unlimited
+		MaxConnections: -1, // unlimited
 		BandwidthMbps:  -1,
 		DataLimitBytes: -1,
 		DaysExpiry:     -1,
@@ -346,18 +357,18 @@ var Tiers = map[string]Tier{
 // ─── User CRUD ─────────────────────────────────────────────────────────────
 
 type User struct {
-	ID              int64   `json:"id"`
-	Username        string  `json:"username"`
-	PasswordHash    string  `json:"-"`
-	Tier            string  `json:"tier"`
-	MaxConnections  int     `json:"max_connections"`
-	BandwidthMbps   int     `json:"bandwidth_mbps"`
-	DataLimitBytes  int64   `json:"data_limit_bytes"`
-	DataUsedBytes   int64   `json:"data_used_bytes"`
-	Expiry          *string `json:"expiry"`
-	Enabled         bool    `json:"enabled"`
-	CreatedAt       string  `json:"created_at"`
-	ActiveConns     int64   `json:"active_connections"`
+	ID             int64   `json:"id"`
+	Username       string  `json:"username"`
+	PasswordHash   string  `json:"-"`
+	Tier           string  `json:"tier"`
+	MaxConnections int     `json:"max_connections"`
+	BandwidthMbps  int     `json:"bandwidth_mbps"`
+	DataLimitBytes int64   `json:"data_limit_bytes"`
+	DataUsedBytes  int64   `json:"data_used_bytes"`
+	Expiry         *string `json:"expiry"`
+	Enabled        bool    `json:"enabled"`
+	CreatedAt      string  `json:"created_at"`
+	ActiveConns    int64   `json:"active_connections"`
 }
 
 func GeneratePassword() string {
