@@ -1086,3 +1086,25 @@ func TestSniffTimeoutClosesSilentConnection(t *testing.T) {
 	}
 	t.Fatal("server sent data on a silent connection")
 }
+
+// ─── Test 21: a bad TUNNEL_PATH must not panic ────────────────────────────
+
+// http.ServeMux panics on a pattern without a leading slash, which took the
+// whole process down at startup. It must be a clear configuration error.
+func TestTunnelPathMustStartWithSlash(t *testing.T) {
+	srv := NewProxyServer(DefaultConfig())
+	srv.tunnelLimiter = newRateLimiter(5)
+
+	tlsCfg, err := buildTLSConfig(DefaultConfig())
+	if err != nil {
+		t.Fatalf("buildTLSConfig: %v", err)
+	}
+
+	srv.cfg.TunnelPath = "tunnel" // no leading slash
+	if err := srv.serveMultiplex("127.0.0.1:0"); err == nil {
+		t.Fatal("serveMultiplex accepted a tunnel path without a leading slash")
+	} else if !strings.Contains(err.Error(), "tunnel_path") {
+		t.Fatalf("error %q should name tunnel_path", err)
+	}
+	_ = tlsCfg
+}
