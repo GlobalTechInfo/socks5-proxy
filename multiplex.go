@@ -536,7 +536,13 @@ func (s *ProxyServer) forwardProxyHandler(w http.ResponseWriter, r *http.Request
 	// The proxy's own credentials must not be forwarded upstream.
 	r.Header.Del("Proxy-Authorization")
 	r.RequestURI = ""
-	r.Header.Del("Connection")
+	// Connection is hop-by-hop framing and normally safe to drop, but a
+	// WebSocket handshake over the forward path is an absolute-form GET whose
+	// upgrade tokens live in Connection: Upgrade and Upgrade: websocket. Deleting
+	// it there makes the origin answer 426, so keep it when it carries "upgrade".
+	if !strings.Contains(strings.ToLower(r.Header.Get("Connection")), "upgrade") {
+		r.Header.Del("Connection")
+	}
 
 	out := &forwardProxy{
 		server: s,
@@ -560,6 +566,13 @@ func (f *forwardProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	defer resp.Body.Close()
 
+	// 101 means the upstream agreed to switch protocol. That response cannot be
+	// relayed through a ResponseWriter, so hijack and pipe raw bytes instead.
+	if resp.StatusCode == http.StatusSwitchingProtocols {
+		f.relayUpgrade(w, resp)
+		return
+	}
+
 	for k, vs := range resp.Header {
 		for _, v := range vs {
 			w.Header().Add(k, v)
@@ -567,6 +580,51 @@ func (f *forwardProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	w.WriteHeader(resp.StatusCode)
 	_, _ = io.Copy(w, resp.Body)
+}
+
+// relayUpgrade hijacks the client connection and copies bytes both ways until
+// either side closes. Go's Transport hands back the switched connection as
+// resp.Body, so keeping it alive for the second copy direction is what lets a
+// WebSocket ride the plain-HTTP forward path.
+func (f *forwardProxy) relayUpgrade(w http.ResponseWriter, resp *http.Response) {
+	hj, ok := w.(http.Hijacker)
+	if !ok {
+		http.Error(w, "upgrade not supported", http.StatusInternalServerError)
+		return
+	}
+	upstream, ok := resp.Body.(io.ReadWriteCloser)
+	if !ok {
+		http.Error(w, "upstream is not a raw connection", http.StatusInternalServerError)
+		return
+	}
+	client, buf, err := hj.Hijack()
+	if err != nil {
+		f.server.logger.Debug("upgrade hijack failed", "error", err)
+		return
+	}
+	defer client.Close()
+
+	// Replay the 101 verbatim so the client's handshake still validates. Body is
+	// cleared first because resp.Write would otherwise try to drain it.
+	resp.Body = nil
+	if err := resp.Write(buf); err != nil {
+		return
+	}
+	if err := buf.Flush(); err != nil {
+		return
+	}
+
+	done := make(chan struct{}, 2)
+	go func() {
+		_, _ = io.Copy(upstream, buf)
+		done <- struct{}{}
+	}()
+	go func() {
+		_, _ = io.Copy(client, upstream)
+		done <- struct{}{}
+	}()
+	<-done
+	f.server.logger.Debug("upgrade relay closed", "status", resp.StatusCode)
 }
 
 // validProxyAuth checks Proxy-Authorization: Basic against the SOCKS5 creds.
