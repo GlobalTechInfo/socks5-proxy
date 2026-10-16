@@ -374,8 +374,13 @@ go test -run TestRealityEndToEnd -v ./...   # needs xray on PATH
   on shutdown. Its own log lines are relayed into this server's log.
 - `whitelist` and `blacklist` apply to the SOCKS5 port, the HTTP proxy
   (`CONNECT` and forward) and the tunnel alike.
-- `/health`, `/metrics`, `/prometheus`, `/api/live`, `/tls-cert` and the tunnel
-  are reachable without admin credentials. Everything else needs basic auth.
+- `/health` is the only endpoint reachable without admin credentials, and it
+  returns `{"status":"ok"}` with no uptime or version: on a public port it is
+  the one thing a scanner can read, so it says nothing. `/metrics`,
+  `/prometheus`, `/api/live` and `/tls-cert` take the admin credentials, and the
+  metrics port (`:9090`) applies them too rather than serving an open dashboard.
+- The tunnel path carries its own token and skips admin auth; every attempt on
+  it, successful or not, answers exactly what an unknown path answers.
 - The HTTP proxy reuses the SOCKS5 credentials and is only served in
   single-port mode.
 - On a public PaaS, put the admin dashboard behind a second hostname or an
@@ -398,7 +403,17 @@ Reachable in both modes; in single-port mode they are all on the one port.
 
 | Method | Endpoint | Description |
 |---|---|---|
-| GET | `/health` | Health check, used by load balancers and the container health check |
+| GET | `/health` | `{"status":"ok"}` and nothing else. Load balancers and the container health check use it |
+
+### Metrics (admin credentials)
+
+These are diagnostics, not load balancers, so they take the same basic auth as
+the dashboard. They used to be public, and `/metrics` is an HTML page that names
+the software — one request identified a deployment as a proxy. Point Prometheus
+at `/prometheus` with `basic_auth` configured.
+
+| Method | Endpoint | Description |
+|---|---|---|
 | GET | `/metrics` | Metrics dashboard (HTML) |
 | GET | `/prometheus` | Prometheus exposition |
 | GET | `/api/live` | Live counters for the charts |

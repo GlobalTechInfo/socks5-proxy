@@ -1027,16 +1027,17 @@ func securityHeaders(next http.Handler) http.Handler {
 	})
 }
 
-// publicPaths are reachable without admin credentials. /health is for load
-// balancers; the rest are metrics mux routes and the certificate endpoint,
-// which are not sensitive. The tunnel path is added at startup because it is
-// configurable, and authenticates via its own token.
+// publicPaths are reachable without admin credentials.
+//
+// Only /health is here, and it answers with nothing but {"status":"ok"}.
+// Everything else on this port used to be public, which meant one GET
+// /metrics handed a scanner an HTML dashboard titled "SOCKS5 Proxy" and /health
+// volunteered the version. Those endpoints are diagnostics for the operator, not
+// load balancers, so they now sit behind the admin credentials the rest of the
+// dashboard uses. The browser reuses the basic-auth challenge for same-origin
+// XHR, so the dashboard still loads without a change.
 var publicPaths = map[string]bool{
-	"/health":     true,
-	"/metrics":    true,
-	"/prometheus": true,
-	"/api/live":   true,
-	"/tls-cert":   true,
+	"/health": true,
 }
 
 // tunnelPublicPath records the configured tunnel path so basicAuth can skip it.
@@ -1173,6 +1174,15 @@ func (s *ProxyServer) startAdminServer(addr string) *http.Server {
 func (s *ProxyServer) startMetricsServer(addr string) *http.Server {
 	handler := s.metricsHandler()
 
+	// The metrics port used to serve its dashboard, its Prometheus endpoint and
+	// the live counters to anyone who asked, on a port that is published by
+	// default. /metrics in particular is an HTML page whose title names the
+	// software, so on its own it identifies the deployment as a proxy. Reuse the
+	// admin credentials rather than inventing a second set.
+	if s.cfg.AdminEnabled && s.cfg.AdminUser != "" && s.cfg.AdminPass != "" {
+		handler = basicAuth(s.cfg.AdminUser, s.cfg.AdminPass)(handler)
+	}
+
 	srv := &http.Server{
 		Addr:              addr,
 		Handler:           handler,
@@ -1202,11 +1212,10 @@ func (s *ProxyServer) adminHandler() http.Handler {
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(map[string]string{
-			"status":  "ok",
-			"uptime":  time.Since(s.startTime).Truncate(time.Second).String(),
-			"version": version,
-		})
+		// Deliberately bare. This is the one endpoint an unauthenticated prober
+		// can reach, so the uptime and version that used to be here are exactly
+		// the fingerprinting material not worth publishing.
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 	})
 
 	mux.HandleFunc("/api/stats", func(w http.ResponseWriter, r *http.Request) {

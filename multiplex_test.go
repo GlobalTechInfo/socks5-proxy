@@ -552,26 +552,43 @@ func TestMergedPortPublicPathsNotAuthGated(t *testing.T) {
 		c.RateLimitRPS = 1000
 	})
 
-	for _, path := range []string{"/health", "/metrics", "/tls-cert"} {
+	// Only /health stays open. The rest used to be public, which meant one GET
+	// /metrics handed a scanner an HTML dashboard naming this software and
+	// /health volunteered the version.
+	resp, err := http.Get("http://" + addr + "/health")
+	if err != nil {
+		t.Fatalf("GET /health: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("GET /health = %d, want 200 without admin creds", resp.StatusCode)
+	}
+	if strings.Contains(string(body), version) || strings.Contains(string(body), "uptime") {
+		t.Errorf("GET /health = %q, want no version or uptime: this is the one open endpoint", body)
+	}
+
+	// The diagnostics are operator-facing, so the admin credentials gate them.
+	for _, path := range []string{"/metrics", "/prometheus", "/api/live", "/tls-cert"} {
 		resp, err := http.Get("http://" + addr + path)
 		if err != nil {
 			t.Fatalf("GET %s: %v", path, err)
 		}
 		resp.Body.Close()
-		if resp.StatusCode == http.StatusUnauthorized {
-			t.Errorf("GET %s = 401, want reachable without admin creds", path)
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Errorf("GET %s = %d, want 401: it identifies the deployment", path, resp.StatusCode)
 		}
 	}
 
 	// The tunnel path must also skip admin auth. It carries its own token, so
 	// assert with a valid token: if admin auth were still gating the path, this
 	// would 401 even though the token is correct.
-	resp, err := http.Get("http://" + addr + defaultTunnelPath + "?token=test-token")
+	tunnelResp, err := http.Get("http://" + addr + defaultTunnelPath + "?token=test-token")
 	if err != nil {
 		t.Fatalf("GET tunnel: %v", err)
 	}
-	resp.Body.Close()
-	if resp.StatusCode == http.StatusUnauthorized {
+	tunnelResp.Body.Close()
+	if tunnelResp.StatusCode == http.StatusUnauthorized {
 		t.Error("tunnel with valid token = 401: admin auth is gating the tunnel path")
 	}
 
