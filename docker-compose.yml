@@ -13,6 +13,27 @@ services:
       - "8080:8080"
       - "9090:9090"
 
+    # REALITY needs port 443, but the image runs as a non-root user and the
+    # kernel reserves ports below 1024. This namespaced sysctl is what lets the
+    # xray child bind 443 without running the container as root or granting
+    # NET_BIND_SERVICE. It is harmless when REALITY is off.
+    sysctls:
+      net.ipv4.ip_unprivileged_port_start: "0"
+
+    # REALITY front door. Uncomment on a VPS with a dedicated IP and a DNS-only
+    # A record for the domain -- grey cloud, no CDN proxy in front. Set
+    # REALITY_PUBLIC_HOST to that domain so the generated reality-client.json is
+    # usable as-is.
+    #
+    # ports:
+    #   - "443:443"
+    # environment:
+    #   - REALITY_ENABLED=true
+    #   - REALITY_PUBLIC_HOST=proxy.example.com
+    #   - REALITY_DEST=www.lovelive-anime.jp:443
+    #
+    # 443 must stay out of SINGLE_PORT: this service and xray cannot share it.
+
     # Single-port layout for PaaS-style hosting. Uncomment to serve the HTTP
     # proxy, the dashboards and the WebSocket tunnel on one port only. The image
     # health check follows this automatically.

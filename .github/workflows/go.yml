@@ -21,6 +21,21 @@ jobs:
       with:
         go-version: '1.24'
 
+    # Without xray, TestRealityEndToEnd skips itself, so the feature that
+    # actually proves REALITY works would never run in CI. Pinned and checksum
+    # verified to match the Dockerfile; change the version and the SHA2-256
+    # together, or the step fails loudly instead of silently skipping.
+    - name: Install xray (for the REALITY end-to-end test)
+      run: |
+        version=v26.3.27
+        sha=23cd9af937744d97776ee35ecad4972cf4b2109d1e0fe6be9930467608f7c8ae
+        curl -fsSL -o /tmp/xray.zip \
+          "https://github.com/XTLS/Xray-core/releases/download/$version/Xray-linux-64.zip"
+        echo "$sha  /tmp/xray.zip" | sha256sum -c -
+        unzip -q /tmp/xray.zip -d /tmp/xray-bin
+        sudo install -m 0755 /tmp/xray-bin/xray /usr/local/bin/xray
+        xray version | head -1
+
     - name: Build
       run: go build -v ./...
 

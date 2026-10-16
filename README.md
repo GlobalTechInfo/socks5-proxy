@@ -9,6 +9,7 @@ Deploys on any PaaS, including the ones that expose only a single HTTP endpoint.
 - **SOCKS5 Protocol** - Full SOCKS5 proxy support with username/password authentication
 - **Single-Port Multiplexing** - SOCKS5, TLS, dashboards and the tunnel share one port, so it runs on Render/Koyeb/Heroku/Northflank where raw TCP never reaches the app
 - **WebSocket Tunnel** - Carries SOCKS5 over an HTTP upgrade for platforms whose edge terminates TLS; ships with a matching client
+- **REALITY** - Xray front door that presents a real website's certificate to an active prober; sessions still land in the SOCKS5 pipeline
 - **Client Mode** - Same binary exposes a local SOCKS5 port that relays through the tunnel
 - **User Management** - Create, update, delete users with tier-based limits
 - **Tier System** - Free, Basic, Pro, and Unlimited tiers with connection/data/bandwidth limits
@@ -39,6 +40,10 @@ docker build -t socks5-proxy .
 docker run -p 1080:1080 -p 8080:8080 -p 9090:9090 socks5-proxy
 # One port, as on a PaaS
 docker run -e PORT=8080 -p 8080:8080 socks5-proxy
+# A REALITY front door on 443, as on a VPS with a dedicated IP (see below)
+docker run --sysctl net.ipv4.ip_unprivileged_port_start=0 \
+  -p 443:443 -p 1080:1080 -p 8080:8080 -p 9090:9090 \
+  -e REALITY_ENABLED=true -e REALITY_PUBLIC_HOST=proxy.example.com socks5-proxy
 ```
 
 `PORT` is deliberately not baked into the image, so the image works in both
@@ -56,7 +61,8 @@ SQLite is kept on a named volume, so it survives rebuilds.
 ## Protocols
 
 The server speaks four protocols. In single-port mode all of them share one
-port, dispatched on the first byte or request shape.
+port, dispatched on the first byte or request shape. A fifth, REALITY, arrives
+separately on port 443 via xray.
 
 | Protocol | Endpoint | Used by |
 |---|---|---|
@@ -64,6 +70,7 @@ port, dispatched on the first byte or request shape.
 | **SOCKS5 over WebSocket** | `/api/v1/tunnel` | SOCKS5 clients where raw TCP is blocked, via the bundled client |
 | **HTTP proxy** — `CONNECT` and absolute-form | single port | Browsers and any HTTP client with proxy support |
 | **HTTPS** | single port | TLS-wrapped access to any of the above |
+| **VLESS + REALITY** | `:443` via xray | Clients on a VPS where the front door must look like a website |
 
 Authentication is username/password throughout, taken from `PROXY_USER` and
 `PROXY_PASS` for the proxy protocols, and `ADMIN_USER`/`ADMIN_PASS` for the
@@ -107,7 +114,7 @@ Point Telegram (Android, iOS, Desktop), Signal Desktop, a browser, or any SOCKS5
 | Platform | Raw TCP to app | What to set |
 |---|---|---|
 | **Koyeb** | Yes, via TCP Proxy (`--proxy-ports 1080:tcp`, public preview) | Nothing; use raw SOCKS5 |
-| **VPS** | Yes | Nothing |
+| **VPS** | Yes | Nothing; or `REALITY_ENABLED=true` if the front door must be unfingerprintable |
 | **Render** | No (Cloudflare, HTTP only) | `TUNNEL_ENABLED=true` + `TUNNEL_TOKEN` |
 | **Northflank** | No (public HTTP on 80/443) | `SINGLE_PORT` + `TUNNEL_ENABLED=true` + `TUNNEL_TOKEN` |
 | **Heroku** | No | `TUNNEL_ENABLED=true` + `TUNNEL_TOKEN` |
@@ -121,12 +128,129 @@ koyeb app init socks5 --docker -i small \
   --env PROXY_USER=user --env PROXY_PASS=secret
 ```
 
+## REALITY (Xray)
+
+Two front doors, for two different networks:
+
+| | Tunnel | REALITY |
+|---|---|---|
+| Transport | WebSocket over HTTPS | VLESS + REALITY over raw TCP |
+| Needs | Any HTTPS-reachable host | VPS, dedicated IP, DNS-only A record |
+| Behind a CDN | Yes, that is the point | **No** — impossible, see below |
+| Active prober sees | Whatever an unknown path answers, byte for byte | The camouflage site's real certificate |
+| Use on | Render, Koyeb, Heroku, Northflank | A VPS you control |
+
+REALITY is an Xray transport that is indistinguishable from a real website.
+The server holds a private key and, for unauthenticated connections, relays the
+handshake to a real site and presents *its* certificate. A prober scanning your
+port sees a live website, not a proxy. An authenticated client is equally
+invisible: same certificate, same handshake, same site.
+
+Check it yourself:
+
+```bash
+openssl s_client -connect YOUR_IP:443 -servername www.lovelive-anime.jp </dev/null 2>/dev/null \
+  | openssl x509 -noout -subject -issuer
+# subject=CN=*.lovelive-anime.jp    <- a real site's certificate, not the proxy's
+```
+
+This service stays the proxy brain. Xray terminates REALITY and forwards every
+session to the SOCKS5 port here, so users, tiers, rate limits, metrics and
+destination statistics all behave exactly as they do on the raw port.
+
+Xray runs as a supervised child process rather than being reimplemented, because
+REALITY needs uTLS and certificate relay. That keeps the build CGO-free and the
+dependency list unchanged. The Docker image ships a pinned, checksum-verified
+xray; elsewhere install it or set `XRAY_BIN`.
+
+### Deploying
+
+Requirements, all of them: a VPS with **one dedicated IP**, TCP 443 open to the
+world, and a domain whose DNS record is **grey cloud** (DNS-only, no CDN proxy).
+
+```bash
+# .env
+REALITY_ENABLED=true
+REALITY_PUBLIC_HOST=proxy.example.com
+REALITY_DEST=www.lovelive-anime.jp:443
+PROXY_PASS=...   ADMIN_PASS=...
+
+docker compose up -d      # with the "443:443" port block uncommented
+```
+
+Port 443 is privileged and the image runs as a non-root user, so the xray child
+cannot bind it without help. `docker-compose.yml` already sets
+`sysctls: net.ipv4.ip_unprivileged_port_start: "0"` for that reason; with a plain
+`docker run`, pass the same flag:
+
+```bash
+docker run --sysctl net.ipv4.ip_unprivileged_port_start=0 \
+  -p 443:443 -p 1080:1080 -p 8080:8080 -p 9090:9090 \
+  -e REALITY_ENABLED=true -e REALITY_PUBLIC_HOST=proxy.example.com socks5-proxy
+```
+
+Without it xray logs `permission denied` and the proxy refuses to start.
+
+The generated keypair, short id and client id are printed on startup and reused
+from the database afterwards. A client config is written to `reality-client.json`.
+
+```bash
+# client machine: point apps at 127.0.0.1:1081
+./socks5-proxy reality-client -config reality-client.json
+# or -server proxy.example.com to override the address the server guessed
+```
+
+That file is an ordinary Xray client config, so Hiddify, v2rayN, Nekoray or any
+other REALITY-capable client can import the same parameters instead:
+
+| Field | Value |
+|---|---|
+| Address / port | Your server IP or domain, 443 |
+| UUID | `client_id` from the startup log |
+| Public key | `public_key` from the startup log |
+| Short ID | `short_id` from the startup log |
+| SNI | `server_name`, i.e. the camouflage host |
+| Fingerprint | `chrome` |
+| Flow | none |
+
+Give each device its own UUID (`xray uuid`, then list them in
+`REALITY_CLIENT_IDS`) so one can be revoked without disturbing the others.
+
+Pick the camouflage site with care: it must speak TLS 1.3 with X25519, be
+reachable from the server, and resolve to a real CDN. Xray itself warns against
+apple/icloud targets, and a target that is an obvious outlier can get your IP
+blocked. Do not put `SINGLE_PORT=443` alongside REALITY — this service and xray
+would fight over the port.
+
+### Why REALITY cannot be behind a CDN
+
+The whole mechanism depends on the TLS handshake reaching the server that holds
+the private key. A CDN edge terminates that handshake itself and re-originates
+plain HTTP, so the client completes the handshake with the edge and the origin
+never sees it. No configuration of this binary changes that; it is the edge's
+behaviour, not a setting.
+
+So the two deployment paths are mutually exclusive by physics, not by choice:
+dedicated IP plus raw TCP for REALITY, CDN plus HTTP for the tunnel. Run
+both if you want both — they are separate front doors on separate ports.
+
 ## Limitations
 
-- `TUNNEL_PADDING` equalises message sizes. It does not affect TLS
-  fingerprints or resist active probing.
-- Fingerprint-resistant transports such as Xray/REALITY require raw TCP and a
-  dedicated IP, so they cannot be used behind a shared CDN edge.
+What is still true after all of the above:
+
+- **REALITY needs a dedicated IP.** Shared hosting, NAT port forwarding and CDN
+  edges are all out, for the reason above. Behind a CDN, use the tunnel.
+- **Padding equalises message sizes, nothing more.** `TUNNEL_PADDING` rounds
+  every WebSocket frame to a fixed size with random filler. It does not hide
+  traffic volume, timing or direction, and it cannot survive an observer who
+  measures them. It is not a defence against traffic analysis.
+- **The raw TLS listener is Go's TLS.** Without `TLS_CERT_FILE` the certificate
+  is self-signed and regenerated on restart, which is fingerprintable. There is
+  no uTLS here; that is what REALITY is for, so put anything that must not be
+  fingerprinted behind it.
+- **The camouflage site's certificate is only as good as its uptime.** If the
+  target site is down or slow, handshakes suffer visibly.
+- **No SOCKS5 UDP.** Sessions are TCP only, so REALITY carries TCP too.
 
 ## Configuration
 
@@ -157,6 +281,16 @@ Edit `config.json` or use environment variables (env vars override config file):
 | `TUNNEL_PATH` | /api/v1/tunnel | Tunnel URL path |
 | `TUNNEL_PADDING` | 256 | Message padding size; 0 or 1 disables |
 | `TUNNEL_RATE_LIMIT_RPS` | 5 | Tunnel handshakes per second. Raise for bursty clients |
+| `REALITY_ENABLED` | false | Serve a REALITY front door. Needs xray and a dedicated IP; refuses to start without the binary |
+| `REALITY_BIND` | 0.0.0.0:443 | Address xray's REALITY listener binds. Keep it off any port used elsewhere, including `SINGLE_PORT` |
+| `REALITY_DEST` | www.lovelive-anime.jp:443 | Camouflage site. Its certificate is what a prober sees, so it must be reachable, TLS 1.3 + X25519, and on a real CDN |
+| `REALITY_SERVER_NAMES` | dest host | SNI values to impersonate, comma separated |
+| `REALITY_PRIVATE_KEY` | generated | REALITY private key. Generated once and reused from the database when empty; `xray x25519` prints a pair |
+| `REALITY_SHORT_IDS` | generated | Short ids, comma separated. Up to 16 hex characters; rotating locks out existing clients |
+| `REALITY_CLIENT_IDS` | generated | VLESS UUIDs, comma separated, one per device. `xray uuid` prints one |
+| `REALITY_PUBLIC_HOST` | empty | This host's IP or domain, written into the generated client config so it is usable as-is |
+| `XRAY_BIN` | xray | Path to the xray binary |
+| `REALITY_CLIENT_FILE` | reality-client.json | Where the generated client config is written |
 | `TLS_CERT_FILE` | empty | Certificate path; empty generates a self-signed cert in memory |
 | `TLS_KEY_FILE` | empty | Private key path; empty generates a self-signed cert in memory |
 
@@ -180,6 +314,9 @@ Single-port mode serves all of these on `$SINGLE_PORT` (or `$PORT`), plus the
 tunnel path and `/tls-cert`. When `$SINGLE_PORT` equals `$PROXY_PORT` the extra
 SOCKS5 listener is skipped, because the mux already serves SOCKS5 on that port.
 
+With `REALITY_ENABLED=true` xray also binds 443 (`$REALITY_BIND`) for the
+REALITY front door. That port is never shared with the Go service.
+
 ## Commands
 
 ```
@@ -187,10 +324,13 @@ socks5-proxy                    # server, config.json
 socks5-proxy config.json        # server, explicit config
 socks5-proxy server [cfg.json]  # server, explicit keyword
 socks5-proxy client -flags      # tunnel client
+socks5-proxy reality-client -flags  # REALITY client, using the config the server wrote
 socks5-proxy version
 ```
 
 Client flags: `-url` (required; `https://` is accepted and mapped to `wss://`, and a bare host gets the default tunnel path), `-token` (or `TUNNEL_TOKEN`), `-listen` (default `127.0.0.1:1080`), `-keepalive` (default `30s`), `-padding` (0 = follow the server), `-insecure` (VPS self-signed certs only).
+
+`reality-client` flags: `-config` (default `reality-client.json`), `-server` (override the server address, `host` or `host:port`), `-listen` (override the local SOCKS5 address, default `127.0.0.1:1081`), `-bin` (xray binary).
 
 ## Tests
 
@@ -203,6 +343,13 @@ proxying and its auth, absolute-form forward proxying, tunnel auth and
 round-trip, the real client against the real server end to end, handler merging,
 padding framing, config/env resolution, and non-TCP conn handling.
 
+The REALITY end-to-end test runs the real xray binary through the real proxy and
+skips when xray is not installed:
+
+```bash
+go test -run TestRealityEndToEnd -v ./...   # needs xray on PATH
+```
+
 ## Security notes
 
 - **Change `PROXY_PASS`, `ADMIN_PASS` and `TUNNEL_TOKEN` before exposing the
@@ -211,6 +358,20 @@ padding framing, config/env resolution, and non-TCP conn handling.
   `TUNNEL_TOKEN`, so a misconfigured fork cannot become an open relay. With
   `TUNNEL_ENABLED=false` the tunnel path is not even registered, regardless of
   any token left in the config.
+- A refused tunnel attempt answers exactly what a path that does not exist
+  answers — status, challenge header and body. A disabled tunnel, a wrong token
+  and the rate limiter are therefore indistinguishable from each other, so none
+  of them can be used to locate the tunnel or to enumerate tokens.
+- The server **refuses to start** if `REALITY_ENABLED` is set without the xray
+  binary. The rendered config is validated with `xray run --test` before xray is
+  launched, so a broken setup fails at startup rather than leaving a dead front
+  door.
+- The REALITY private key and the proxy credentials are written to a `0600` temp
+  file for xray, and deleted when xray is stopped. The private key is never
+  returned by `/api/config`; the generated client config holds the **public**
+  key, but is still written `0600` because it contains the VLESS UUIDs.
+- xray is supervised: it is restarted with backoff if it dies, and asked to exit
+  on shutdown. Its own log lines are relayed into this server's log.
 - `whitelist` and `blacklist` apply to the SOCKS5 port, the HTTP proxy
   (`CONNECT` and forward) and the tunnel alike.
 - `/health`, `/metrics`, `/prometheus`, `/api/live`, `/tls-cert` and the tunnel

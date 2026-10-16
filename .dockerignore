@@ -14,6 +14,9 @@
 *.key
 *.crt
 creds.txt
+# Generated REALITY client config: contains the VLESS UUIDs. An operator who ran
+# the server before building must not bake it into an image layer.
+reality-client.json
 
 # Local runtime data: the SQLite database must never be baked into an image.
 data/*

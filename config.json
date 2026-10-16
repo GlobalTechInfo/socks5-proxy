@@ -24,5 +24,15 @@
   "tunnel_padding": 256,
   "tunnel_rate_limit_rps": 5,
   "tls_cert_file": "",
-  "tls_key_file": ""
+  "tls_key_file": "",
+  "reality_enabled": false,
+  "reality_bind": "0.0.0.0:443",
+  "reality_dest": "www.lovelive-anime.jp:443",
+  "reality_server_names": [],
+  "reality_private_key": "",
+  "reality_short_ids": [],
+  "reality_client_ids": [],
+  "reality_public_host": "",
+  "reality_xray_bin": "xray",
+  "reality_client_file": "reality-client.json"
 }

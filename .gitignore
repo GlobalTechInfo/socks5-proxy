@@ -19,6 +19,10 @@ coverage.*
 !web/**
 creds.txt
 
+# Written at startup when REALITY is enabled. It carries the VLESS UUIDs, which
+# are credentials: anyone holding one can connect as that client.
+reality-client.json
+
 # ─── Runtime data ──────────────────────────────────────────────────────────
 # SQLite database and its WAL/SHM sidecars. Only .gitkeep is tracked.
 data/*
