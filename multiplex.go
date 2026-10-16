@@ -315,13 +315,18 @@ func (p *padConn) Write(b []byte) (int, error) {
 		if n > maxFrame {
 			n = maxFrame
 		}
-		// A deterministic fill is as good as random here: the goal is uniform
-		// frame length, not secret bytes.
+		// A deterministic fill would give the padding away: repeated frames would
+		// repeat their own filler, which is a far cheaper tell than frame length
+		// itself. Uniform length is the goal here; secret bytes are not.
 		frame = append(frame[:0], byte(n>>8), byte(n))
 		frame = append(frame, b[:n]...)
-		for len(frame)%p.padTo != 0 {
-			frame = append(frame, byte(len(frame)*31))
+		fill := make([]byte, p.padTo-len(frame)%p.padTo)
+		if _, err := rand.Read(fill); err != nil {
+			for i := range fill {
+				fill[i] = byte(len(frame) * 31)
+			}
 		}
+		frame = append(frame, fill...)
 		if _, err := p.Conn.Write(frame); err != nil {
 			p.writeMu.Unlock()
 			return 0, err
@@ -653,23 +658,21 @@ func validProxyAuth(r *http.Request, wantUser, wantPass string) bool {
 func (s *ProxyServer) tunnelHandler(w http.ResponseWriter, r *http.Request) {
 	cfg := s.currentConfig()
 
-	// Check the documented switch as well as the token. An operator who sets
-	// TUNNEL_ENABLED=false but leaves a token behind must actually get no tunnel.
-	if !cfg.TunnelEnabled {
-		http.Error(w, "tunnel disabled", http.StatusForbidden)
-		return
-	}
-	if cfg.TunnelToken == "" {
-		http.Error(w, "tunnel disabled", http.StatusForbidden)
+	// Every refusal below is byte-identical, on purpose. A disabled tunnel, a
+	// rate-limited attempt and a wrong token must be indistinguishable from a
+	// path that does not exist, because "this path exists but I am not welcome"
+	// is exactly what an active prober is looking for.
+	if !cfg.TunnelEnabled || cfg.TunnelToken == "" {
+		s.writeTunnelRefusal(w, r)
 		return
 	}
 	if !s.tunnelLimiter.allow() {
-		http.Error(w, "too many tunnel attempts", http.StatusTooManyRequests)
+		s.writeTunnelRefusal(w, r)
 		return
 	}
 	if !validTunnelToken(r, cfg.TunnelToken) {
 		s.logger.Warn("tunnel auth failed", "remote", r.RemoteAddr)
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		s.writeTunnelRefusal(w, r)
 		return
 	}
 
@@ -708,6 +711,24 @@ func (s *ProxyServer) tunnelHandler(w http.ResponseWriter, r *http.Request) {
 	clientIP := requestIP(r)
 	s.logger.Info("tunnel session opened", "client", clientIP, "padding", cfg.TunnelPadding)
 	s.handleClient(conn, clientIP)
+}
+
+// writeTunnelRefusal answers exactly what the admin chain answers for a path
+// that does not exist, so the tunnel cannot be found by probing. Which answer
+// that is depends on whether the dashboards are authenticated: 401 with a
+// challenge when they are, 404 when they are not.
+//
+// The condition mirrors the one that installs basicAuth in adminHandler; if
+// that changes, this has to change with it. TestTunnelFailuresAreIndistinguish-
+// able fails if it drifts.
+func (s *ProxyServer) writeTunnelRefusal(w http.ResponseWriter, r *http.Request) {
+	cfg := s.currentConfig()
+	if cfg.AdminEnabled && cfg.AdminUser != "" && cfg.AdminPass != "" {
+		w.Header().Set("WWW-Authenticate", `Basic realm="Admin"`)
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+	http.NotFound(w, r)
 }
 
 // cancelConn ties a context cancel to Close, so tearing down the SOCKS5 session
@@ -797,9 +818,6 @@ func (s *ProxyServer) serveMultiplex(addr string) error {
 	if tunnelPath == "" {
 		tunnelPath = defaultTunnelPath
 	}
-	// Tell the auth layer which path to skip (basicAuth reads this).
-	tunnelPublicPath = tunnelPath
-
 	// Upstream client for absolute-URI forward-proxy requests. Proxy is nil so
 	// nested proxying cannot loop, and the dial is tuned like any other.
 	s.proxyTransport = &http.Transport{
@@ -825,6 +843,10 @@ func (s *ProxyServer) serveMultiplex(addr string) error {
 			return err
 		}
 		tunnelMux.HandleFunc(tunnelPath, s.tunnelHandler)
+		// Tell the auth layer which path to skip (basicAuth reads this). Only
+		// when enabled: a disabled tunnel must answer exactly like any other
+		// unknown path, not like a path that skipped authentication.
+		tunnelPublicPath = tunnelPath
 	}
 	tunnelMux.HandleFunc("/tls-cert", s.tlsCertHandler(tlsCfg))
 

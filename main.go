@@ -28,7 +28,7 @@ import (
 
 // version is reported by the version subcommand, /health and /api/stats, so the
 // three can never disagree.
-const version = "1.2.0"
+const version = "1.3.0"
 
 type Config struct {
 	ProxyPort    int      `json:"proxy_port"`
@@ -74,6 +74,20 @@ type Config struct {
 	// generated in memory at startup.
 	TLSCertFile string `json:"tls_cert_file"`
 	TLSKeyFile  string `json:"tls_key_file"`
+
+	// REALITY front door: Xray terminates VLESS+REALITY and forwards sessions to
+	// the SOCKS5 port, so users and tiers keep applying. Needs a dedicated IP
+	// with raw TCP; a CDN edge would terminate TLS before reaching us.
+	RealityEnabled     bool     `json:"reality_enabled"`
+	RealityBind        string   `json:"reality_bind"`
+	RealityDest        string   `json:"reality_dest"`
+	RealityServerNames []string `json:"reality_server_names"`
+	RealityPrivateKey  string   `json:"reality_private_key"`
+	RealityShortIDs    []string `json:"reality_short_ids"`
+	RealityClientIDs   []string `json:"reality_client_ids"`
+	RealityPublicHost  string   `json:"reality_public_host"`
+	RealityXrayBin     string   `json:"reality_xray_bin"`
+	RealityClientFile  string   `json:"reality_client_file"`
 }
 
 func DefaultConfig() Config {
@@ -96,6 +110,10 @@ func DefaultConfig() Config {
 		TunnelPath:             "/api/v1/tunnel",
 		TunnelPadding:          256,
 		TunnelRateRPS:          5,
+		RealityBind:            defaultRealityBind,
+		RealityDest:            defaultRealityDest,
+		RealityXrayBin:         "xray",
+		RealityClientFile:      defaultRealityClientFile,
 	}
 }
 
@@ -229,6 +247,39 @@ func LoadConfig(filename string) (Config, error) {
 	}
 	if v := os.Getenv("TLS_KEY_FILE"); v != "" {
 		cfg.TLSKeyFile = v
+	}
+
+	// REALITY. Comma-separated lists accept more than one SNI, short id or
+	// VLESS id so a rotation does not need a restart.
+	if v := os.Getenv("REALITY_ENABLED"); v != "" {
+		cfg.RealityEnabled = v == "true" || v == "1"
+	}
+	if v := os.Getenv("REALITY_BIND"); v != "" {
+		cfg.RealityBind = v
+	}
+	if v := os.Getenv("REALITY_DEST"); v != "" {
+		cfg.RealityDest = v
+	}
+	if v := os.Getenv("REALITY_SERVER_NAMES"); v != "" {
+		cfg.RealityServerNames = splitList(v)
+	}
+	if v := os.Getenv("REALITY_PRIVATE_KEY"); v != "" {
+		cfg.RealityPrivateKey = v
+	}
+	if v := os.Getenv("REALITY_SHORT_IDS"); v != "" {
+		cfg.RealityShortIDs = splitList(v)
+	}
+	if v := os.Getenv("REALITY_CLIENT_IDS"); v != "" {
+		cfg.RealityClientIDs = splitList(v)
+	}
+	if v := os.Getenv("REALITY_PUBLIC_HOST"); v != "" {
+		cfg.RealityPublicHost = v
+	}
+	if v := os.Getenv("XRAY_BIN"); v != "" {
+		cfg.RealityXrayBin = v
+	}
+	if v := os.Getenv("REALITY_CLIENT_FILE"); v != "" {
+		cfg.RealityClientFile = v
 	}
 
 	return cfg, nil
@@ -976,16 +1027,17 @@ func securityHeaders(next http.Handler) http.Handler {
 	})
 }
 
-// publicPaths are reachable without admin credentials. /health is for load
-// balancers; the rest are metrics mux routes and the certificate endpoint,
-// which are not sensitive. The tunnel path is added at startup because it is
-// configurable, and authenticates via its own token.
+// publicPaths are reachable without admin credentials.
+//
+// Only /health is here, and it answers with nothing but {"status":"ok"}.
+// Everything else on this port used to be public, which meant one GET
+// /metrics handed a scanner an HTML dashboard titled "SOCKS5 Proxy" and /health
+// volunteered the version. Those endpoints are diagnostics for the operator, not
+// load balancers, so they now sit behind the admin credentials the rest of the
+// dashboard uses. The browser reuses the basic-auth challenge for same-origin
+// XHR, so the dashboard still loads without a change.
 var publicPaths = map[string]bool{
-	"/health":     true,
-	"/metrics":    true,
-	"/prometheus": true,
-	"/api/live":   true,
-	"/tls-cert":   true,
+	"/health": true,
 }
 
 // tunnelPublicPath records the configured tunnel path so basicAuth can skip it.
@@ -1122,6 +1174,15 @@ func (s *ProxyServer) startAdminServer(addr string) *http.Server {
 func (s *ProxyServer) startMetricsServer(addr string) *http.Server {
 	handler := s.metricsHandler()
 
+	// The metrics port used to serve its dashboard, its Prometheus endpoint and
+	// the live counters to anyone who asked, on a port that is published by
+	// default. /metrics in particular is an HTML page whose title names the
+	// software, so on its own it identifies the deployment as a proxy. Reuse the
+	// admin credentials rather than inventing a second set.
+	if s.cfg.AdminEnabled && s.cfg.AdminUser != "" && s.cfg.AdminPass != "" {
+		handler = basicAuth(s.cfg.AdminUser, s.cfg.AdminPass)(handler)
+	}
+
 	srv := &http.Server{
 		Addr:              addr,
 		Handler:           handler,
@@ -1151,11 +1212,10 @@ func (s *ProxyServer) adminHandler() http.Handler {
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(map[string]string{
-			"status":  "ok",
-			"uptime":  time.Since(s.startTime).Truncate(time.Second).String(),
-			"version": version,
-		})
+		// Deliberately bare. This is the one endpoint an unauthenticated prober
+		// can reach, so the uptime and version that used to be here are exactly
+		// the fingerprinting material not worth publishing.
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 	})
 
 	mux.HandleFunc("/api/stats", func(w http.ResponseWriter, r *http.Request) {
@@ -1653,6 +1713,12 @@ func main() {
 				os.Exit(1)
 			}
 			return
+		case "reality-client":
+			if err := runRealityClient(os.Args[2:]); err != nil {
+				logger.Error("reality client failed", "error", err)
+				os.Exit(1)
+			}
+			return
 		case "server":
 			runServer(logger, configArg(2))
 			return
@@ -1691,7 +1757,8 @@ func runServer(logger *slog.Logger, configFile string) {
 	defer store.Close()
 
 	// Load persisted config overrides from DB
-	if dbCfg := store.LoadConfig(); len(dbCfg) > 0 {
+	dbCfg := store.LoadConfig()
+	if len(dbCfg) > 0 {
 		if v, ok := dbCfg["max_connections"]; ok {
 			if n, err := strconv.Atoi(v); err == nil && n > 0 {
 				cfg.MaxConns = n
@@ -1779,6 +1846,21 @@ func runServer(logger *slog.Logger, configFile string) {
 		defer listener.Close()
 	}
 
+	// REALITY starts last, once this proxy's own listeners are up. xray dials
+	// the SOCKS5 port lazily per session, so the order does not matter to it,
+	// but it does matter here: every os.Exit above leaves no orphaned child
+	// holding port 443, and a broken REALITY setup still fails the process
+	// rather than leaving a front door that never came up.
+	var reality *realityRunner
+	if cfg.RealityEnabled {
+		runner, err := startRealityForServer(cfg, dbCfg, store, logger)
+		if err != nil {
+			logger.Error("failed to start REALITY", "error", err)
+			os.Exit(1)
+		}
+		reality = runner
+	}
+
 	// Periodic stats persistence (every 60 seconds)
 	go func() {
 		ticker := time.NewTicker(60 * time.Second)
@@ -1833,6 +1915,7 @@ func runServer(logger *slog.Logger, configFile string) {
 		"rate_limit", cfg.RateLimitEnabled,
 		"max_conns", cfg.MaxConns,
 		"tunnel", cfg.TunnelEnabled,
+		"reality", cfg.RealityEnabled,
 	)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -1877,6 +1960,12 @@ func runServer(logger *slog.Logger, configFile string) {
 		listener.Close()
 	}
 	close(server.shutdownCh)
+
+	// Xray holds the REALITY private key in a temp config and a bound port.
+	// Both go away with it, so it is stopped before the drain begins.
+	if reality != nil {
+		reality.Stop()
+	}
 
 	httpCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
