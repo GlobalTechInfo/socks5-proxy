@@ -48,6 +48,78 @@ names exactly one build. Build it yourself with `workflow_dispatch`, or
 the Dockerfile or the Go sources — that PR run is what proves the pinned xray
 download and its checksum still work.
 
+### Setting your own variables
+
+Nothing secret is in the image — no password, no token, no key — and that is the
+point: one published image serves every operator. Your values are supplied at
+run time, on the machine that runs it.
+
+```bash
+# 1. create .env on the server, from the template
+cp <(curl -sL https://raw.githubusercontent.com/GlobalTechInfo/socks5-proxy/main/.env.example) .env
+# or just write it: cp .env.example .env  (if you have the repo checked out)
+chmod 600 .env
+
+# 2. edit it: PROXY_USER, PROXY_PASS, ADMIN_USER, ADMIN_PASS
+#    plus TUNNEL_TOKEN, or REALITY_* if you enable REALITY
+
+# 3. run it, reading that file
+docker run --env-file .env \
+  -p 1080:1080 -p 8080:8080 -p 9090:9090 \
+  ghcr.io/globaltechinfo/socks5-proxy:latest
+```
+
+Three equivalent ways to pass variables, in increasing order of precedence over
+the image's own `config.json`:
+
+| Method | Example | Notes |
+|---|---|---|
+| Edit `config.json` in a volume | `-v /srv/socks5/config.json:/app/config.json:ro` | For values you never rotate |
+| `--env-file` | `docker run --env-file .env …` | Secrets stay in one file on the server, `chmod 600` |
+| `-e` per variable | `docker run -e PROXY_PASS=… -e PORT=8080 …` | Convenient for one-off or PaaS-injected values like `PORT` |
+
+The binary does not read `.env` itself — that is docker's and compose's job, and
+the container only sees what they pass in.
+
+With compose, `env_file: .env` in `docker-compose.yml` already does this, and
+PaaS platforms that inject `PORT` work with no configuration at all.
+
+You can also pin the REALITY keypair without installing xray anywhere, since the
+binary is inside the image:
+
+```bash
+docker run --rm --entrypoint xray ghcr.io/globaltechinfo/socks5-proxy:latest x25519
+# PrivateKey: ...            -> REALITY_PRIVATE_KEY
+# Password (PublicKey): ...  -> what clients configure as "public key"
+```
+
+**Precedence gotcha worth knowing.** The server resolves configuration in this
+order, last one winning:
+
+```
+built-in defaults  <  config.json  <  environment  <  database
+```
+
+The database is last because the admin dashboard saves settings from the UI, and
+it only ever holds those 10 keys: `max_connections`, `proxy_user`, `proxy_pass`,
+`auth_enabled`, `admin_username`, `admin_pass`, `admin_auth_enabled`,
+`security_headers_enabled`, `rate_limit_enabled`, `rate_limit_rps`. So on an
+install where somebody has already saved settings in the dashboard, **a new
+`PROXY_PASS` in `.env` is silently ignored on restart** — the stored value wins.
+Either change the password from the dashboard, or clear the stored keys once:
+
+```bash
+docker exec -it <container> sh -c 'rm -f /app/data/socks5.db /app/data/socks5.db-wal /app/data/socks5.db-shm && echo cleared'
+```
+
+All three files matter: SQLite runs in WAL mode, so deleting only `socks5.db`
+leaves a write-ahead log that gets replayed on the next open and puts your saved
+settings straight back.
+
+That also drops users and usage history, so copy `data/socks5.db` out first if
+you want them. `TUNNEL_*`, `REALITY_*`, timeouts and limits are never stored, so those
+always come from your file or environment.
+
 ### Binary
 
 ```bash
