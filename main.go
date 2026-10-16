@@ -28,7 +28,7 @@ import (
 
 // version is reported by the version subcommand, /health and /api/stats, so the
 // three can never disagree.
-const version = "1.2.0"
+const version = "1.3.0"
 
 type Config struct {
 	ProxyPort    int      `json:"proxy_port"`
@@ -74,6 +74,20 @@ type Config struct {
 	// generated in memory at startup.
 	TLSCertFile string `json:"tls_cert_file"`
 	TLSKeyFile  string `json:"tls_key_file"`
+
+	// REALITY front door: Xray terminates VLESS+REALITY and forwards sessions to
+	// the SOCKS5 port, so users and tiers keep applying. Needs a dedicated IP
+	// with raw TCP; a CDN edge would terminate TLS before reaching us.
+	RealityEnabled     bool     `json:"reality_enabled"`
+	RealityBind        string   `json:"reality_bind"`
+	RealityDest        string   `json:"reality_dest"`
+	RealityServerNames []string `json:"reality_server_names"`
+	RealityPrivateKey  string   `json:"reality_private_key"`
+	RealityShortIDs    []string `json:"reality_short_ids"`
+	RealityClientIDs   []string `json:"reality_client_ids"`
+	RealityPublicHost  string   `json:"reality_public_host"`
+	RealityXrayBin     string   `json:"reality_xray_bin"`
+	RealityClientFile  string   `json:"reality_client_file"`
 }
 
 func DefaultConfig() Config {
@@ -96,6 +110,10 @@ func DefaultConfig() Config {
 		TunnelPath:             "/api/v1/tunnel",
 		TunnelPadding:          256,
 		TunnelRateRPS:          5,
+		RealityBind:            defaultRealityBind,
+		RealityDest:            defaultRealityDest,
+		RealityXrayBin:         "xray",
+		RealityClientFile:      defaultRealityClientFile,
 	}
 }
 
@@ -229,6 +247,39 @@ func LoadConfig(filename string) (Config, error) {
 	}
 	if v := os.Getenv("TLS_KEY_FILE"); v != "" {
 		cfg.TLSKeyFile = v
+	}
+
+	// REALITY. Comma-separated lists accept more than one SNI, short id or
+	// VLESS id so a rotation does not need a restart.
+	if v := os.Getenv("REALITY_ENABLED"); v != "" {
+		cfg.RealityEnabled = v == "true" || v == "1"
+	}
+	if v := os.Getenv("REALITY_BIND"); v != "" {
+		cfg.RealityBind = v
+	}
+	if v := os.Getenv("REALITY_DEST"); v != "" {
+		cfg.RealityDest = v
+	}
+	if v := os.Getenv("REALITY_SERVER_NAMES"); v != "" {
+		cfg.RealityServerNames = splitList(v)
+	}
+	if v := os.Getenv("REALITY_PRIVATE_KEY"); v != "" {
+		cfg.RealityPrivateKey = v
+	}
+	if v := os.Getenv("REALITY_SHORT_IDS"); v != "" {
+		cfg.RealityShortIDs = splitList(v)
+	}
+	if v := os.Getenv("REALITY_CLIENT_IDS"); v != "" {
+		cfg.RealityClientIDs = splitList(v)
+	}
+	if v := os.Getenv("REALITY_PUBLIC_HOST"); v != "" {
+		cfg.RealityPublicHost = v
+	}
+	if v := os.Getenv("XRAY_BIN"); v != "" {
+		cfg.RealityXrayBin = v
+	}
+	if v := os.Getenv("REALITY_CLIENT_FILE"); v != "" {
+		cfg.RealityClientFile = v
 	}
 
 	return cfg, nil
@@ -1653,6 +1704,12 @@ func main() {
 				os.Exit(1)
 			}
 			return
+		case "reality-client":
+			if err := runRealityClient(os.Args[2:]); err != nil {
+				logger.Error("reality client failed", "error", err)
+				os.Exit(1)
+			}
+			return
 		case "server":
 			runServer(logger, configArg(2))
 			return
@@ -1691,7 +1748,8 @@ func runServer(logger *slog.Logger, configFile string) {
 	defer store.Close()
 
 	// Load persisted config overrides from DB
-	if dbCfg := store.LoadConfig(); len(dbCfg) > 0 {
+	dbCfg := store.LoadConfig()
+	if len(dbCfg) > 0 {
 		if v, ok := dbCfg["max_connections"]; ok {
 			if n, err := strconv.Atoi(v); err == nil && n > 0 {
 				cfg.MaxConns = n
@@ -1779,6 +1837,21 @@ func runServer(logger *slog.Logger, configFile string) {
 		defer listener.Close()
 	}
 
+	// REALITY starts last, once this proxy's own listeners are up. xray dials
+	// the SOCKS5 port lazily per session, so the order does not matter to it,
+	// but it does matter here: every os.Exit above leaves no orphaned child
+	// holding port 443, and a broken REALITY setup still fails the process
+	// rather than leaving a front door that never came up.
+	var reality *realityRunner
+	if cfg.RealityEnabled {
+		runner, err := startRealityForServer(cfg, dbCfg, store, logger)
+		if err != nil {
+			logger.Error("failed to start REALITY", "error", err)
+			os.Exit(1)
+		}
+		reality = runner
+	}
+
 	// Periodic stats persistence (every 60 seconds)
 	go func() {
 		ticker := time.NewTicker(60 * time.Second)
@@ -1833,6 +1906,7 @@ func runServer(logger *slog.Logger, configFile string) {
 		"rate_limit", cfg.RateLimitEnabled,
 		"max_conns", cfg.MaxConns,
 		"tunnel", cfg.TunnelEnabled,
+		"reality", cfg.RealityEnabled,
 	)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -1877,6 +1951,12 @@ func runServer(logger *slog.Logger, configFile string) {
 		listener.Close()
 	}
 	close(server.shutdownCh)
+
+	// Xray holds the REALITY private key in a temp config and a bound port.
+	// Both go away with it, so it is stopped before the drain begins.
+	if reality != nil {
+		reality.Stop()
+	}
 
 	httpCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
