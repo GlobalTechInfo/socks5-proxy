@@ -1,10 +1,5 @@
 services:
   socks5-proxy:
-    # Built from source by default. To run the published image instead, comment
-    # out the build: block above and use these two lines:
-    #
-    #   image: ghcr.io/globaltechinfo/socks5-proxy:latest
-    #   pull_policy: always
     build:
       context: .
       dockerfile: Dockerfile

@@ -25,48 +25,47 @@ Deploys on any PaaS, including the ones that expose only a single HTTP endpoint.
 
 ## Quick Start
 
-### Prebuilt image (multi-arch, amd64 + arm64)
+### Binary
 
 ```bash
-docker pull ghcr.io/globaltechinfo/socks5-proxy:latest
-
-# Three ports, as on a VPS with raw TCP
-docker run -p 1080:1080 -p 8080:8080 -p 9090:9090 ghcr.io/globaltechinfo/socks5-proxy
-# One port, as on a PaaS
-docker run -e PORT=8080 -p 8080:8080 ghcr.io/globaltechinfo/socks5-proxy
-# REALITY on 443 (needs the sysctl: the image runs as a non-root user)
-docker run --sysctl net.ipv4.ip_unprivileged_port_start=0 \
-  -p 443:443 -p 1080:1080 -p 8080:8080 -p 9090:9090 \
-  -e REALITY_ENABLED=true -e REALITY_PUBLIC_HOST=proxy.example.com \
-  ghcr.io/globaltechinfo/socks5-proxy
+go build -o socks5-proxy .
+./socks5-proxy config.json
 ```
 
-Images are pushed on a release tag and on demand, tagged with the commit SHA.
-There is deliberately no `latest` for every main commit, so a version tag always
-names exactly one build. Build it yourself with `workflow_dispatch`, or
-`.github/workflows/docker.yml` builds (without pushing) on every PR that touches
-the Dockerfile or the Go sources — that PR run is what proves the pinned xray
-download and its checksum still work.
+### Build the image yourself
+
+```bash
+docker build -t socks5-proxy .
+# Three ports, as on a VPS with raw TCP
+docker run -p 1080:1080 -p 8080:8080 -p 9090:9090 socks5-proxy
+# One port, as on a PaaS
+docker run -e PORT=8080 -p 8080:8080 socks5-proxy
+# A REALITY front door on 443, as on a VPS with a dedicated IP (see below)
+docker run --sysctl net.ipv4.ip_unprivileged_port_start=0 \
+  -p 443:443 -p 1080:1080 -p 8080:8080 -p 9090:9090 \
+  -e REALITY_ENABLED=true -e REALITY_PUBLIC_HOST=proxy.example.com socks5-proxy
+```
+
+`PORT` is deliberately not baked into the image, so the image works in both
+layouts. Supplying it switches on single-port mode.
 
 ### Setting your own variables
 
-Nothing secret is in the image — no password, no token, no key — and that is the
-point: one published image serves every operator. Your values are supplied at
-run time, on the machine that runs it.
+Nothing secret is baked into the image — no password, no token, no key. Your
+values are supplied at run time, on the machine that runs it, so the same build
+works for every operator.
 
 ```bash
-# 1. create .env on the server, from the template
-cp <(curl -sL https://raw.githubusercontent.com/GlobalTechInfo/socks5-proxy/main/.env.example) .env
-# or just write it: cp .env.example .env  (if you have the repo checked out)
+# 1. write your secrets on the server (this file is gitignored)
+cp .env.example .env
 chmod 600 .env
+$EDITOR .env        # PROXY_USER, PROXY_PASS, ADMIN_USER, ADMIN_PASS,
+                    # TUNNEL_TOKEN, or REALITY_* if you enable REALITY
 
-# 2. edit it: PROXY_USER, PROXY_PASS, ADMIN_USER, ADMIN_PASS
-#    plus TUNNEL_TOKEN, or REALITY_* if you enable REALITY
-
-# 3. run it, reading that file
+# 2. run it, reading that file
 docker run --env-file .env \
   -p 1080:1080 -p 8080:8080 -p 9090:9090 \
-  ghcr.io/globaltechinfo/socks5-proxy:latest
+  socks5-proxy
 ```
 
 Three equivalent ways to pass variables, in increasing order of precedence over
@@ -78,17 +77,20 @@ the image's own `config.json`:
 | `--env-file` | `docker run --env-file .env …` | Secrets stay in one file on the server, `chmod 600` |
 | `-e` per variable | `docker run -e PROXY_PASS=… -e PORT=8080 …` | Convenient for one-off or PaaS-injected values like `PORT` |
 
+`.env` is excluded from the build context, so it cannot end up inside the image
+even if you leave it in the source tree.
+
 The binary does not read `.env` itself — that is docker's and compose's job, and
 the container only sees what they pass in.
 
 With compose, `env_file: .env` in `docker-compose.yml` already does this, and
 PaaS platforms that inject `PORT` work with no configuration at all.
 
-You can also pin the REALITY keypair without installing xray anywhere, since the
-binary is inside the image:
+You can also pin the REALITY keypair without installing xray on the host, since
+the binary is inside the image:
 
 ```bash
-docker run --rm --entrypoint xray ghcr.io/globaltechinfo/socks5-proxy:latest x25519
+docker run --rm --entrypoint xray socks5-proxy x25519
 # PrivateKey: ...            -> REALITY_PRIVATE_KEY
 # Password (PublicKey): ...  -> what clients configure as "public key"
 ```
@@ -117,32 +119,8 @@ leaves a write-ahead log that gets replayed on the next open and puts your saved
 settings straight back.
 
 That also drops users and usage history, so copy `data/socks5.db` out first if
-you want them. `TUNNEL_*`, `REALITY_*`, timeouts and limits are never stored, so those
-always come from your file or environment.
-
-### Binary
-
-```bash
-go build -o socks5-proxy .
-./socks5-proxy config.json
-```
-
-### Build the image yourself
-
-```bash
-docker build -t socks5-proxy .
-# Three ports, as on a VPS with raw TCP
-docker run -p 1080:1080 -p 8080:8080 -p 9090:9090 socks5-proxy
-# One port, as on a PaaS
-docker run -e PORT=8080 -p 8080:8080 socks5-proxy
-# A REALITY front door on 443, as on a VPS with a dedicated IP (see below)
-docker run --sysctl net.ipv4.ip_unprivileged_port_start=0 \
-  -p 443:443 -p 1080:1080 -p 8080:8080 -p 9090:9090 \
-  -e REALITY_ENABLED=true -e REALITY_PUBLIC_HOST=proxy.example.com socks5-proxy
-```
-
-`PORT` is deliberately not baked into the image, so the image works in both
-layouts. Supplying it switches on single-port mode.
+you want them. `TUNNEL_*`, `REALITY_*`, timeouts and limits are never stored, so
+those always come from your file or environment.
 
 ### Docker Compose
 
@@ -273,9 +251,8 @@ PROXY_PASS=...   ADMIN_PASS=...
 docker compose up -d      # with the "443:443" port block uncommented
 ```
 
-`docker-compose.yml` builds from source. To use the published image instead,
-comment out its `build:` block and use `image:` with `pull_policy: always`, as
-shown in the file.
+`docker-compose.yml` builds from source and reads `.env` for its variables, so
+`docker compose up -d` is usually all that is needed.
 
 Port 443 is privileged and the image runs as a non-root user, so the xray child
 cannot bind it without help. `docker-compose.yml` already sets
