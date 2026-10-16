@@ -32,7 +32,7 @@ go build -o socks5-proxy .
 ./socks5-proxy config.json
 ```
 
-### Docker
+### Build the image yourself
 
 ```bash
 docker build -t socks5-proxy .
@@ -48,6 +48,79 @@ docker run --sysctl net.ipv4.ip_unprivileged_port_start=0 \
 
 `PORT` is deliberately not baked into the image, so the image works in both
 layouts. Supplying it switches on single-port mode.
+
+### Setting your own variables
+
+Nothing secret is baked into the image — no password, no token, no key. Your
+values are supplied at run time, on the machine that runs it, so the same build
+works for every operator.
+
+```bash
+# 1. write your secrets on the server (this file is gitignored)
+cp .env.example .env
+chmod 600 .env
+$EDITOR .env        # PROXY_USER, PROXY_PASS, ADMIN_USER, ADMIN_PASS,
+                    # TUNNEL_TOKEN, or REALITY_* if you enable REALITY
+
+# 2. run it, reading that file
+docker run --env-file .env \
+  -p 1080:1080 -p 8080:8080 -p 9090:9090 \
+  socks5-proxy
+```
+
+Three equivalent ways to pass variables, in increasing order of precedence over
+the image's own `config.json`:
+
+| Method | Example | Notes |
+|---|---|---|
+| Edit `config.json` in a volume | `-v /srv/socks5/config.json:/app/config.json:ro` | For values you never rotate |
+| `--env-file` | `docker run --env-file .env …` | Secrets stay in one file on the server, `chmod 600` |
+| `-e` per variable | `docker run -e PROXY_PASS=… -e PORT=8080 …` | Convenient for one-off or PaaS-injected values like `PORT` |
+
+`.env` is excluded from the build context, so it cannot end up inside the image
+even if you leave it in the source tree.
+
+The binary does not read `.env` itself — that is docker's and compose's job, and
+the container only sees what they pass in.
+
+With compose, `env_file: .env` in `docker-compose.yml` already does this, and
+PaaS platforms that inject `PORT` work with no configuration at all.
+
+You can also pin the REALITY keypair without installing xray on the host, since
+the binary is inside the image:
+
+```bash
+docker run --rm --entrypoint xray socks5-proxy x25519
+# PrivateKey: ...            -> REALITY_PRIVATE_KEY
+# Password (PublicKey): ...  -> what clients configure as "public key"
+```
+
+**Precedence gotcha worth knowing.** The server resolves configuration in this
+order, last one winning:
+
+```
+built-in defaults  <  config.json  <  environment  <  database
+```
+
+The database is last because the admin dashboard saves settings from the UI, and
+it only ever holds those 10 keys: `max_connections`, `proxy_user`, `proxy_pass`,
+`auth_enabled`, `admin_username`, `admin_pass`, `admin_auth_enabled`,
+`security_headers_enabled`, `rate_limit_enabled`, `rate_limit_rps`. So on an
+install where somebody has already saved settings in the dashboard, **a new
+`PROXY_PASS` in `.env` is silently ignored on restart** — the stored value wins.
+Either change the password from the dashboard, or clear the stored keys once:
+
+```bash
+docker exec -it <container> sh -c 'rm -f /app/data/socks5.db /app/data/socks5.db-wal /app/data/socks5.db-shm && echo cleared'
+```
+
+All three files matter: SQLite runs in WAL mode, so deleting only `socks5.db`
+leaves a write-ahead log that gets replayed on the next open and puts your saved
+settings straight back.
+
+That also drops users and usage history, so copy `data/socks5.db` out first if
+you want them. `TUNNEL_*`, `REALITY_*`, timeouts and limits are never stored, so
+those always come from your file or environment.
 
 ### Docker Compose
 
@@ -177,6 +250,9 @@ PROXY_PASS=...   ADMIN_PASS=...
 
 docker compose up -d      # with the "443:443" port block uncommented
 ```
+
+`docker-compose.yml` builds from source and reads `.env` for its variables, so
+`docker compose up -d` is usually all that is needed.
 
 Port 443 is privileged and the image runs as a non-root user, so the xray child
 cannot bind it without help. `docker-compose.yml` already sets
