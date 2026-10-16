@@ -529,10 +529,14 @@ func TestE2ETunnelRateLimitRejectsBurst(t *testing.T) {
 
 	// Hit the real tunnel path: an upgrade carrying the token. The limiter sits in
 	// front of it, so a burst wider than the bucket must be refused.
+	//
+	// A refused attempt deliberately does not answer with its own status: the
+	// tunnel must be indistinguishable from a path that does not exist, so only
+	// "upgraded" versus "did not" is asserted here.
 	const path = "/api/v1/tunnel?token=e2e-rate-token"
 	var wg sync.WaitGroup
 	var mu sync.Mutex
-	accepted, throttled, other := 0, 0, 0
+	accepted, refused := 0, 0
 	for range 20 {
 		wg.Add(1)
 		go func() {
@@ -549,19 +553,16 @@ func TestE2ETunnelRateLimitRejectsBurst(t *testing.T) {
 			resp, err := http.ReadResponse(newBufReader(conn), nil)
 			if err != nil {
 				mu.Lock()
-				other++
+				refused++
 				mu.Unlock()
 				return
 			}
 			resp.Body.Close()
 			mu.Lock()
-			switch resp.StatusCode {
-			case http.StatusSwitchingProtocols:
+			if resp.StatusCode == http.StatusSwitchingProtocols {
 				accepted++
-			case http.StatusTooManyRequests:
-				throttled++
-			default:
-				other++
+			} else {
+				refused++
 			}
 			mu.Unlock()
 		}()
@@ -569,12 +570,15 @@ func TestE2ETunnelRateLimitRejectsBurst(t *testing.T) {
 	wg.Wait()
 
 	if accepted == 0 {
-		t.Fatalf("limiter refused every request (throttled=%d other=%d); it may be stuck at 0", throttled, other)
+		t.Fatalf("limiter refused every request (refused=%d); it may be stuck at 0", refused)
+	}
+	if refused == 0 {
+		t.Fatalf("limiter let all %d requests through with a 5 rps limit", accepted)
 	}
 	if accepted > 12 {
 		t.Fatalf("accepted %d/20 upgrades despite a 5 rps limit; limiter is not throttling", accepted)
 	}
-	t.Logf("limiter held: %d accepted, %d throttled, %d other (limit 5 rps)", accepted, throttled, other)
+	t.Logf("limiter held: %d accepted, %d refused (limit 5 rps)", accepted, refused)
 }
 
 // ─── 6. wss:// through CONNECT ────────────────────────────────────────────

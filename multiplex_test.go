@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
@@ -244,27 +245,23 @@ func TestTunnelRoundTrip(t *testing.T) {
 func TestTunnelRequiresToken(t *testing.T) {
 	addr := startTestServer(t, nil)
 
-	t.Run("missing", func(t *testing.T) {
-		resp, err := http.Get("http://" + addr + defaultTunnelPath)
-		if err != nil {
-			t.Fatalf("GET tunnel: %v", err)
-		}
-		defer resp.Body.Close()
-		if resp.StatusCode != http.StatusUnauthorized {
-			t.Fatalf("no-token GET = %d, want 401", resp.StatusCode)
-		}
-	})
-
-	t.Run("wrong", func(t *testing.T) {
-		resp, err := http.Get("http://" + addr + defaultTunnelPath + "?token=wrong")
-		if err != nil {
-			t.Fatalf("GET tunnel: %v", err)
-		}
-		defer resp.Body.Close()
-		if resp.StatusCode != http.StatusUnauthorized {
-			t.Fatalf("bad-token GET = %d, want 401", resp.StatusCode)
-		}
-	})
+	// The status itself is deliberately not asserted here. A refused tunnel
+	// answers exactly what an unknown path answers, so it is 401 with the
+	// dashboards authenticated and 404 without;
+	// TestTunnelFailuresAreIndistinguishable pins that pairing, and what
+	// matters here is only that the session never upgrades.
+	for _, path := range []string{defaultTunnelPath, defaultTunnelPath + "?token=wrong"} {
+		t.Run(path, func(t *testing.T) {
+			resp, err := http.Get("http://" + addr + path)
+			if err != nil {
+				t.Fatalf("GET tunnel: %v", err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode == http.StatusSwitchingProtocols || resp.StatusCode == http.StatusOK {
+				t.Fatalf("GET %s = %d: the tunnel upgraded without a valid token", path, resp.StatusCode)
+			}
+		})
+	}
 }
 
 // ─── Test 7: padding conn ─────────────────────────────────────────────────
@@ -364,6 +361,105 @@ func TestPadConnDisabled(t *testing.T) {
 	if c := newPadConn(a, 1); c != net.Conn(a) {
 		t.Fatal("padding 1 should return the conn unchanged")
 	}
+}
+
+// The filler must not be a fixed pattern. Repeated frames carrying a repeated
+// payload are exactly what the padding hides; repeating the filler as well
+// hands an observer something far cheaper to match than frame length.
+func TestPadConnFillIsNotRepeated(t *testing.T) {
+	frame := func() []byte {
+		w, r := socketPair(t)
+		pc := newPadConn(w, 256)
+		done := make(chan error, 1)
+		go func() {
+			_, err := pc.Write([]byte{0x05, 0x00})
+			done <- err
+		}()
+		buf := make([]byte, 256)
+		r.SetReadDeadline(time.Now().Add(5 * time.Second))
+		if _, err := io.ReadFull(r, buf); err != nil {
+			t.Fatalf("read frame: %v", err)
+		}
+		if err := <-done; err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		return buf
+	}
+
+	first, second := frame(), frame()
+	if !bytes.Equal(first[:4], second[:4]) {
+		t.Fatalf("identical payloads produced different headers: %v vs %v", first[:4], second[:4])
+	}
+	if bytes.Equal(first[4:], second[4:]) {
+		t.Fatal("padding is identical for identical payloads, so it is a fixed pattern")
+	}
+}
+
+// An active prober looking for the tunnel must see the same answer everywhere:
+// no token, a wrong token, a disabled tunnel and a path that simply does not
+// exist are the same observation.
+func TestTunnelFailuresAreIndistinguishable(t *testing.T) {
+	fingerprint := func(t *testing.T, addr, path string) (int, string, string) {
+		t.Helper()
+		resp, err := http.Get("http://" + addr + path)
+		if err != nil {
+			t.Fatalf("GET %s: %v", path, err)
+		}
+		defer resp.Body.Close()
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatalf("read body: %v", err)
+		}
+		return resp.StatusCode, resp.Header.Get("WWW-Authenticate"), string(body)
+	}
+
+	const unknownPath = "/definitely-not-a-real-path-8f21c4"
+
+	t.Run("enabled tunnel", func(t *testing.T) {
+		addr := startTestServer(t, nil)
+		wantCode, wantChallenge, wantBody := fingerprint(t, addr, unknownPath)
+		for _, path := range []string{
+			defaultTunnelPath,
+			defaultTunnelPath + "?token=wrong",
+			defaultTunnelPath + "?token=",
+		} {
+			code, challenge, body := fingerprint(t, addr, path)
+			if code != wantCode || challenge != wantChallenge || body != wantBody {
+				t.Errorf("GET %s = %d %q %q, want the unknown-path answer %d %q %q",
+					path, code, challenge, body, wantCode, wantChallenge, wantBody)
+			}
+		}
+	})
+
+	t.Run("disabled tunnel", func(t *testing.T) {
+		addr := startTestServer(t, func(c *Config) { c.TunnelEnabled = false })
+		wantCode, wantChallenge, wantBody := fingerprint(t, addr, unknownPath)
+		code, challenge, body := fingerprint(t, addr, defaultTunnelPath)
+		if code != wantCode || challenge != wantChallenge || body != wantBody {
+			t.Errorf("disabled tunnel at %s = %d %q %q, want the unknown-path answer %d %q %q",
+				defaultTunnelPath, code, challenge, body, wantCode, wantChallenge, wantBody)
+		}
+	})
+
+	// With the dashboards authenticated an unknown path answers 401 with a
+	// challenge, so the tunnel must produce that shape too rather than a 404
+	// that only it would give.
+	t.Run("enabled tunnel with admin auth", func(t *testing.T) {
+		addr := startTestServer(t, func(c *Config) {
+			c.AdminEnabled = true
+			c.AdminUser = "admin"
+			c.AdminPass = "secret"
+		})
+		wantCode, wantChallenge, wantBody := fingerprint(t, addr, unknownPath)
+		if wantCode != http.StatusUnauthorized || wantChallenge == "" {
+			t.Fatalf("unknown path = %d %q, want a 401 carrying a challenge", wantCode, wantChallenge)
+		}
+		code, challenge, body := fingerprint(t, addr, defaultTunnelPath+"?token=wrong")
+		if code != wantCode || challenge != wantChallenge || body != wantBody {
+			t.Errorf("GET %s = %d %q %q, want the unknown-path answer %d %q %q",
+				defaultTunnelPath, code, challenge, body, wantCode, wantChallenge, wantBody)
+		}
+	})
 }
 
 // ─── Test 8: merge handler picks the right mux ────────────────────────────
