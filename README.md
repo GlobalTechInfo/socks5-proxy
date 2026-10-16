@@ -25,6 +25,29 @@ Deploys on any PaaS, including the ones that expose only a single HTTP endpoint.
 
 ## Quick Start
 
+### Prebuilt image (multi-arch, amd64 + arm64)
+
+```bash
+docker pull ghcr.io/globaltechinfo/socks5-proxy:latest
+
+# Three ports, as on a VPS with raw TCP
+docker run -p 1080:1080 -p 8080:8080 -p 9090:9090 ghcr.io/globaltechinfo/socks5-proxy
+# One port, as on a PaaS
+docker run -e PORT=8080 -p 8080:8080 ghcr.io/globaltechinfo/socks5-proxy
+# REALITY on 443 (needs the sysctl: the image runs as a non-root user)
+docker run --sysctl net.ipv4.ip_unprivileged_port_start=0 \
+  -p 443:443 -p 1080:1080 -p 8080:8080 -p 9090:9090 \
+  -e REALITY_ENABLED=true -e REALITY_PUBLIC_HOST=proxy.example.com \
+  ghcr.io/globaltechinfo/socks5-proxy
+```
+
+Images are pushed on a release tag and on demand, tagged with the commit SHA.
+There is deliberately no `latest` for every main commit, so a version tag always
+names exactly one build. Build it yourself with `workflow_dispatch`, or
+`.github/workflows/docker.yml` builds (without pushing) on every PR that touches
+the Dockerfile or the Go sources — that PR run is what proves the pinned xray
+download and its checksum still work.
+
 ### Binary
 
 ```bash
@@ -32,7 +55,7 @@ go build -o socks5-proxy .
 ./socks5-proxy config.json
 ```
 
-### Docker
+### Build the image yourself
 
 ```bash
 docker build -t socks5-proxy .
@@ -177,6 +200,10 @@ PROXY_PASS=...   ADMIN_PASS=...
 
 docker compose up -d      # with the "443:443" port block uncommented
 ```
+
+`docker-compose.yml` builds from source. To use the published image instead,
+comment out its `build:` block and use `image:` with `pull_policy: always`, as
+shown in the file.
 
 Port 443 is privileged and the image runs as a non-root user, so the xray child
 cannot bind it without help. `docker-compose.yml` already sets
