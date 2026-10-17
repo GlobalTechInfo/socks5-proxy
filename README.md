@@ -16,6 +16,7 @@ Deploys on any PaaS, including the ones that expose only a single HTTP endpoint.
 - **User Management** - Create, update, delete users with tier-based limits
 - **Tier System** - Free, Basic, Pro, and Unlimited tiers with connection/data/bandwidth limits
 - **Rate Limiting** - Token-bucket rate limiting with configurable RPS
+- **Hashed Passwords** - PBKDF2-HMAC-SHA256 in the database; a stolen file is not a list of credentials
 - **Message Padding** - Optional uniform-size framing so a 2-byte SOCKS5 reply is indistinguishable from bulk traffic
 - **Security Headers** - CSP, XSS protection, frame options, and more
 - **Admin Dashboard** - Full management UI with charts and user CRUD
@@ -448,8 +449,8 @@ Client flags: `-url` (required; `https://` is accepted and mapped to `wss://`, a
 # Take a backup. Works while the server is running.
 socks5-proxy backup -out socks5-20261017.tar.gz
 
-# Encrypt it. A backup contains every user password and, with REALITY enabled,
-# the private key -- so encryption is worth the passphrase.
+# Encrypt it. A backup holds password hashes and, with REALITY enabled, the
+# private key -- so encryption is worth the passphrase.
 socks5-proxy backup -out socks5-20261017.tar.gz -passphrase 'a good passphrase'
 
 # Look inside without restoring anything.
@@ -526,9 +527,19 @@ go test -run TestRealityEndToEnd -v ./...   # needs xray on PATH
   on shutdown. Its own log lines are relayed into this server's log.
 - `whitelist` and `blacklist` apply to the SOCKS5 port, the HTTP proxy
   (`CONNECT` and forward) and the tunnel alike.
-- A backup contains every user password in the clear, plus the REALITY private
-  key when it is enabled. Use `-passphrase` for anything that leaves the machine,
-  and keep the passphrase somewhere other than the backup directory.
+- User passwords are stored as **PBKDF2-HMAC-SHA256 hashes** (600k iterations,
+  per-user salt), never as text, so a database file or a backup does not hand
+  over working credentials. Accounts created before hashing existed keep
+  working: their password is verified against the old value and the row is
+  rewritten on the next successful login, so an install upgrades itself one
+  account at a time with no migration to run.
+- `PROXY_USER`/`PROXY_PASS` and `ADMIN_USER`/`ADMIN_PASS` come from the
+  environment or config file and stay as they are — there is nothing in the
+  database to hash, and the file is already a secret you control.
+- A backup contains password **hashes**, not passwords, plus the REALITY private
+  key when it is enabled. The key is the reason to use `-passphrase` for
+  anything that leaves the machine; keep the passphrase somewhere other than the
+  backup directory.
 - `/health` is the only endpoint reachable without admin credentials, and it
   returns `{"status":"ok"}` with no uptime or version: on a public port it is
   the one thing a scanner can read, so it says nothing. `/metrics`,
@@ -600,6 +611,10 @@ at `/prometheus` with `basic_auth` configured.
 | PUT | `/api/users/:id` | Update user |
 | DELETE | `/api/users/:id` | Delete user |
 | POST | `/api/users/:id/reset` | Reset a user's data usage |
+| GET | `/api/vless-clients` | REALITY client UUIDs, and whether they can be managed |
+| POST | `/api/vless-clients` | Add a client; the UUID is generated if omitted |
+| PUT | `/api/vless-clients/:id` | Relabel, or enable/disable, a client |
+| DELETE | `/api/vless-clients/:id` | Revoke a client, effective immediately |
 | GET | `/api/top-destinations?n=10` | Most-visited destinations |
 | GET | `/api/history/stats?n=60` | Historical connection/byte counters |
 | GET | `/api/history/destinations` | Destination history |
