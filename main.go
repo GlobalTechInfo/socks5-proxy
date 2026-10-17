@@ -77,6 +77,14 @@ type Config struct {
 	TLSCertFile string `json:"tls_cert_file"`
 	TLSKeyFile  string `json:"tls_key_file"`
 
+	// MTProto front door for Telegram. Its own protocol, so it is spoken here
+	// rather than by xray, and it needs a port of its own: 443 is usually taken
+	// by REALITY.
+	MTProtoEnabled bool   `json:"mtproto_enabled"`
+	MTProtoBind    string `json:"mtproto_bind"`
+	// Datacenter overrides, as dc=address,dc=address.
+	MTProtoDCs string `json:"mtproto_dcs"`
+
 	// SOCKS5 UDP ASSOCIATE. TCP-only was the original behaviour, and a proxy
 	// that cannot carry UDP breaks DNS lookups and QUIC unless the client falls
 	// back. The WebSocket tunnel is TCP-only by nature and cannot offer it.
@@ -125,6 +133,7 @@ func DefaultConfig() Config {
 		TunnelPadding:          256,
 		TunnelRateRPS:          5,
 		UDPEnabled:             true,
+		MTProtoBind:            defaultMTProtoBind,
 		RealityBind:            defaultRealityBind,
 		RealityDest:            defaultRealityDest,
 		RealityXrayBin:         "xray",
@@ -279,6 +288,16 @@ func LoadConfig(filename string) (Config, error) {
 
 	if v := os.Getenv("UDP_ENABLED"); v != "" {
 		cfg.UDPEnabled = v == "true" || v == "1"
+	}
+
+	if v := os.Getenv("MTPROTO_ENABLED"); v != "" {
+		cfg.MTProtoEnabled = v == "true" || v == "1"
+	}
+	if v := os.Getenv("MTPROTO_BIND"); v != "" {
+		cfg.MTProtoBind = v
+	}
+	if v := os.Getenv("MTPROTO_DCS"); v != "" {
+		cfg.MTProtoDCs = v
 	}
 
 	// REALITY. Comma-separated lists accept more than one SNI, short id or
@@ -545,6 +564,13 @@ type ProxyServer struct {
 	realityMu   sync.Mutex
 	reality     *realityRunner
 	realityKeys realityKeys
+
+	// MTProto front door. The secrets are kept in memory because they are read
+	// on every connection; the database holds them so the dashboard can manage
+	// them across restarts.
+	mtprotoMu       sync.RWMutex
+	mtprotoSecrets  mtprotoSecrets
+	mtprotoListener net.Listener
 
 	// Shutdown
 	shutdownOnce sync.Once
@@ -1898,6 +1924,120 @@ func (s *ProxyServer) adminHandler() http.Handler {
 		}
 	})
 
+	// ─── MTProto secrets (Telegram) ───────────────────────────────────────
+	//
+	// The live set lives in memory and is consulted on every connection, so
+	// adding or revoking a secret takes effect at once with nothing to restart.
+	mux.HandleFunc("/api/mtproto-secrets", func(w http.ResponseWriter, r *http.Request) {
+		if s.store == nil {
+			http.Error(w, "database not available", http.StatusServiceUnavailable)
+			return
+		}
+
+		switch r.Method {
+		case http.MethodGet:
+			secrets, err := s.store.ListMtprotoSecrets()
+			if err != nil {
+				http.Error(w, "list failed: "+err.Error(), http.StatusInternalServerError)
+				return
+			}
+			s.configMu.RLock()
+			enabled := s.cfg.MTProtoEnabled
+			s.configMu.RUnlock()
+			s.mtprotoMu.RLock()
+			live := len(s.mtprotoSecrets)
+			bind := ""
+			if s.mtprotoListener != nil {
+				bind = s.mtprotoListener.Addr().String()
+			}
+			s.mtprotoMu.RUnlock()
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]any{
+				"secrets":         secrets,
+				"mtproto_enabled": enabled,
+				"bind":            bind,
+				"live_secrets":    live,
+			})
+
+		case http.MethodPost:
+			s.configMu.RLock()
+			enabled := s.cfg.MTProtoEnabled
+			s.configMu.RUnlock()
+			if !enabled {
+				http.Error(w, "MTPROTO_ENABLED is false, so there is no listener for a secret to work on", http.StatusConflict)
+				return
+			}
+			var req struct {
+				Label string `json:"label"`
+			}
+			if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req); err != nil {
+				http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
+				return
+			}
+			secret, err := generateMTProtoSecret()
+			if err != nil {
+				http.Error(w, "could not generate a secret: "+err.Error(), http.StatusInternalServerError)
+				return
+			}
+			created, err := s.store.CreateMtprotoSecret(secret, req.Label)
+			if err != nil {
+				http.Error(w, "create failed: "+err.Error(), http.StatusInternalServerError)
+				return
+			}
+			s.setMTProtoSecrets(s.loadMTProtoSecrets(nil, false))
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusCreated)
+			json.NewEncoder(w).Encode(created)
+
+		default:
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		}
+	})
+
+	mux.HandleFunc("/api/mtproto-secrets/", func(w http.ResponseWriter, r *http.Request) {
+		if s.store == nil {
+			http.Error(w, "database not available", http.StatusServiceUnavailable)
+			return
+		}
+		parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/api/mtproto-secrets/"), "/")
+		if len(parts) == 0 || parts[0] == "" {
+			http.Error(w, "secret ID required", http.StatusBadRequest)
+			return
+		}
+		id := parseInt64(parts[0])
+
+		switch {
+		case r.Method == http.MethodDelete && len(parts) == 1:
+			if err := s.store.DeleteMtprotoSecret(id); err != nil {
+				http.Error(w, "delete failed: "+err.Error(), http.StatusInternalServerError)
+				return
+			}
+			s.setMTProtoSecrets(s.loadMTProtoSecrets(nil, false))
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]string{"status": "deleted"})
+
+		case r.Method == http.MethodPut && len(parts) == 1:
+			var req struct {
+				Label   *string `json:"label"`
+				Enabled *bool   `json:"enabled"`
+			}
+			if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req); err != nil {
+				http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
+				return
+			}
+			if err := s.store.UpdateMtprotoSecret(id, req.Label, req.Enabled); err != nil {
+				http.Error(w, "update failed: "+err.Error(), http.StatusInternalServerError)
+				return
+			}
+			s.setMTProtoSecrets(s.loadMTProtoSecrets(nil, false))
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]string{"status": "updated"})
+
+		default:
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		}
+	})
+
 	// GET /api/tiers - list available tiers
 	mux.HandleFunc("/api/tiers", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
@@ -2252,6 +2392,15 @@ func runServer(logger *slog.Logger, configFile string) {
 		server.reality, server.realityKeys = runner, keys
 	}
 
+	// MTProto speaks its own protocol rather than SOCKS5, so it is served here.
+	// A failure is not fatal: the other protocols keep working, and an operator
+	// who did not ask for this should not find the service refusing to start.
+	if cfg.MTProtoEnabled {
+		if err := server.startMTProto(nil); err != nil {
+			logger.Error("failed to start the MTProto front door", "error", err)
+		}
+	}
+
 	// Periodic stats persistence (every 60 seconds)
 	go func() {
 		ticker := time.NewTicker(60 * time.Second)
@@ -2357,6 +2506,7 @@ func runServer(logger *slog.Logger, configFile string) {
 	if reality != nil {
 		reality.Stop()
 	}
+	server.stopMTProto()
 
 	httpCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
