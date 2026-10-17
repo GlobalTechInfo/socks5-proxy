@@ -95,32 +95,31 @@ docker run --rm --entrypoint xray socks5-proxy x25519
 # Password (PublicKey): ...  -> what clients configure as "public key"
 ```
 
-**Precedence gotcha worth knowing.** The server resolves configuration in this
-order, last one winning:
+**How precedence actually resolves**, last one winning:
 
 ```
-built-in defaults  <  config.json  <  environment  <  database
+built-in defaults  <  config.json  <  database <  environment
 ```
 
-The database is last because the admin dashboard saves settings from the UI, and
-it only ever holds those 10 keys: `max_connections`, `proxy_user`, `proxy_pass`,
-`auth_enabled`, `admin_username`, `admin_pass`, `admin_auth_enabled`,
-`security_headers_enabled`, `rate_limit_enabled`, `rate_limit_rps`. So on an
-install where somebody has already saved settings in the dashboard, **a new
-`PROXY_PASS` in `.env` is silently ignored on restart** — the stored value wins.
-Either change the password from the dashboard, or clear the stored keys once:
+The database holds only the 10 settings the dashboard can save: `max_connections`,
+`proxy_user`, `proxy_pass`, `auth_enabled`, `admin_username`, `admin_pass`,
+`admin_auth_enabled`, `security_headers_enabled`, `rate_limit_enabled` and
+`rate_limit_rps`. The environment sits above it, so an explicit `.env` value is
+never quietly overwritten by something saved from the browser three weeks ago —
+that used to happen, and it made editing `.env` look broken.
+
+To hand a setting back to the database instead, unset it from `.env` and change
+it in the dashboard. To clear stored settings entirely, stop the container first
+and remove all three files, since SQLite runs in WAL mode:
 
 ```bash
-docker exec -it <container> sh -c 'rm -f /app/data/socks5.db /app/data/socks5.db-wal /app/data/socks5.db-shm && echo cleared'
+docker compose down
+rm -f data/socks5.db data/socks5.db-wal data/socks5.db-shm
 ```
 
-All three files matter: SQLite runs in WAL mode, so deleting only `socks5.db`
-leaves a write-ahead log that gets replayed on the next open and puts your saved
-settings straight back.
-
-That also drops users and usage history, so copy `data/socks5.db` out first if
-you want them. `TUNNEL_*`, `REALITY_*`, timeouts and limits are never stored, so
-those always come from your file or environment.
+That also drops users and usage history, so copy `data/socks5.db` out first if you
+want them. `TUNNEL_*`, `REALITY_*`, timeouts and limits are never stored, so they
+always come from your file or environment.
 
 ### Docker Compose
 
@@ -292,6 +291,9 @@ other REALITY-capable client can import the same parameters instead:
 Give each device its own UUID (`xray uuid`, then list them in
 `REALITY_CLIENT_IDS`) so one can be revoked without disturbing the others.
 
+`REALITY_BIND` defaults to `0.0.0.0:443`, which is IPv4 only. On an IPv6-only
+host set it to `[::]:443`.
+
 Pick the camouflage site with care: it must speak TLS 1.3 with X25519, be
 reachable from the server, and resolve to a real CDN. Xray itself warns against
 apple/icloud targets, and a target that is an obvious outlier can get your IP
@@ -351,7 +353,7 @@ Edit `config.json` or use environment variables (env vars override config file):
 | `IDLE_TIMEOUT_SECONDS` | 300 | Deadline on an **established** proxy session. Raise it if clients idle longer |
 | `SECURITY_HEADERS_ENABLED` | true | Enable security headers |
 | `RATE_LIMIT_ENABLED` | true | Enable rate limiting on admin endpoints |
-| `RATE_LIMIT_RPS` | 30 | Admin requests per second per client |
+| `RATE_LIMIT_RPS` | 30 | Admin requests per second **per client**, keyed by IP. One client cannot spend another's budget. Clients behind one carrier NAT share a bucket |
 | `TUNNEL_ENABLED` | false | Enable the WebSocket tunnel. Refused at startup without a token |
 | `TUNNEL_TOKEN` | empty | Shared secret for the tunnel path and the client |
 | `TUNNEL_PATH` | /api/v1/tunnel | Tunnel URL path |
@@ -470,6 +472,13 @@ go test -run TestRealityEndToEnd -v ./...   # needs xray on PATH
 | Basic | 5 | 5 Mbps | 50 GB | 30 days |
 | Pro | 20 | 50 Mbps | Unlimited | 90 days |
 | Unlimited | Unlimited | Unlimited | Unlimited | Never |
+
+Bandwidth is enforced per direction on every session: a Free-tier session moves
+at most 1 Mbps each way, with a one-second burst allowance so short transfers
+are not penalised. A user's limit is captured when the account is created, so
+changing a tier later does not retroactively re-rate existing accounts. Sessions
+authenticated with the single `PROXY_USER`/`PROXY_PASS` pair, and the HTTP proxy
+paths that share it, run unrestricted — there is no per-user tier to apply.
 
 ## API Endpoints
 

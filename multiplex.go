@@ -401,7 +401,7 @@ func (s *ProxyServer) connectHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
-	if !s.tunnelLimiter.allow() {
+	if !s.tunnelLimiter.allow(requestIP(r)) {
 		http.Error(w, "too many requests", http.StatusTooManyRequests)
 		return
 	}
@@ -519,7 +519,7 @@ func (s *ProxyServer) forwardProxyHandler(w http.ResponseWriter, r *http.Request
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
-	if !s.tunnelLimiter.allow() {
+	if !s.tunnelLimiter.allow(requestIP(r)) {
 		http.Error(w, "too many requests", http.StatusTooManyRequests)
 		return
 	}
@@ -658,6 +658,8 @@ func validProxyAuth(r *http.Request, wantUser, wantPass string) bool {
 func (s *ProxyServer) tunnelHandler(w http.ResponseWriter, r *http.Request) {
 	cfg := s.currentConfig()
 
+	clientIP := requestIP(r)
+
 	// Every refusal below is byte-identical, on purpose. A disabled tunnel, a
 	// rate-limited attempt and a wrong token must be indistinguishable from a
 	// path that does not exist, because "this path exists but I am not welcome"
@@ -666,7 +668,7 @@ func (s *ProxyServer) tunnelHandler(w http.ResponseWriter, r *http.Request) {
 		s.writeTunnelRefusal(w, r)
 		return
 	}
-	if !s.tunnelLimiter.allow() {
+	if !s.tunnelLimiter.allow(clientIP) {
 		s.writeTunnelRefusal(w, r)
 		return
 	}
@@ -708,7 +710,6 @@ func (s *ProxyServer) tunnelHandler(w http.ResponseWriter, r *http.Request) {
 		conn = newPadConn(conn, cfg.TunnelPadding)
 	}
 
-	clientIP := requestIP(r)
 	s.logger.Info("tunnel session opened", "client", clientIP, "padding", cfg.TunnelPadding)
 	s.handleClient(conn, clientIP)
 }
@@ -812,7 +813,7 @@ func (s *ProxyServer) serveMultiplex(addr string) error {
 		return err
 	}
 
-	s.tunnelLimiter = newRateLimiter(cfg.TunnelRateRPS)
+	s.tunnelLimiter = newRateLimiterSet(cfg.TunnelRateRPS)
 
 	tunnelPath := cfg.TunnelPath
 	if tunnelPath == "" {

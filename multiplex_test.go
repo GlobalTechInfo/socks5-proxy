@@ -1217,7 +1217,7 @@ func TestTunnelPathRejectsServeMuxPanics(t *testing.T) {
 	for name, path := range bad {
 		t.Run(name, func(t *testing.T) {
 			srv := NewProxyServer(DefaultConfig())
-			srv.tunnelLimiter = newRateLimiter(5)
+			srv.tunnelLimiter = newRateLimiterSet(5)
 			srv.cfg.TunnelEnabled = true
 			srv.cfg.TunnelPath = path
 
@@ -1233,7 +1233,7 @@ func TestTunnelPathRejectsServeMuxPanics(t *testing.T) {
 
 	// A valid path must still start.
 	srv := NewProxyServer(DefaultConfig())
-	srv.tunnelLimiter = newRateLimiter(5)
+	srv.tunnelLimiter = newRateLimiterSet(5)
 	srv.cfg.TunnelEnabled = true
 	srv.cfg.TunnelPath = "/api/v1/tunnel"
 	if err := srv.serveMultiplex("127.0.0.1:0"); err != nil {
@@ -1246,7 +1246,7 @@ func TestTunnelPathRejectsServeMuxPanics(t *testing.T) {
 // TUNNEL_ENABLED=false while leaving a stale TUNNEL_PATH behind.
 func TestDisabledTunnelIgnoresPath(t *testing.T) {
 	srv := NewProxyServer(DefaultConfig())
-	srv.tunnelLimiter = newRateLimiter(5)
+	srv.tunnelLimiter = newRateLimiterSet(5)
 	srv.cfg.TunnelEnabled = false
 	srv.cfg.TunnelPath = "not-even-a-path"
 
