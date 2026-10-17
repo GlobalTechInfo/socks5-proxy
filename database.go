@@ -416,6 +416,14 @@ func (s *Store) CreateUser(username, password, tier string) (*User, error) {
 		return nil, fmt.Errorf("unknown tier: %s", tier)
 	}
 
+	// Hash before the row exists, so no code path can write a plaintext
+	// password by accident. The caller keeps the plaintext it passed in and is
+	// the one that may show it once.
+	hashed, err := HashPassword(password)
+	if err != nil {
+		return nil, err
+	}
+
 	var expiry *string
 	if t.DaysExpiry > 0 {
 		e := time.Now().AddDate(0, 0, t.DaysExpiry).Format("2006-01-02 15:04:05")
@@ -428,7 +436,7 @@ func (s *Store) CreateUser(username, password, tier string) (*User, error) {
 	result, err := s.db.Exec(
 		`INSERT INTO users (username, password_hash, tier, max_connections, bandwidth_mbps, data_limit_bytes, expiry)
 		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		username, password, tier, t.MaxConnections, t.BandwidthMbps, t.DataLimitBytes, expiry,
+		username, hashed, tier, t.MaxConnections, t.BandwidthMbps, t.DataLimitBytes, expiry,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("insert user: %w", err)
@@ -537,7 +545,11 @@ func (s *Store) UpdateUser(id int64, tier *string, password *string, enabled *bo
 		}
 	}
 	if password != nil {
-		_, err := s.db.Exec("UPDATE users SET password_hash=?, updated_at=CURRENT_TIMESTAMP WHERE id=?", *password, id)
+		hashed, err := HashPassword(*password)
+		if err != nil {
+			return err
+		}
+		_, err = s.db.Exec("UPDATE users SET password_hash=?, updated_at=CURRENT_TIMESTAMP WHERE id=?", hashed, id)
 		if err != nil {
 			return err
 		}
@@ -578,6 +590,17 @@ func (s *Store) DeleteUser(id int64) error {
 		return err
 	}
 	return tx.Commit()
+}
+
+// UpgradeUserPassword rewrites a row that still holds a pre-hashing password.
+// It is called after a successful login, so an install cleans itself up one
+// account at a time instead of needing a migration over every credential.
+func (s *Store) UpgradeUserPassword(id int64, hash string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	_, err := s.db.Exec("UPDATE users SET password_hash=?, updated_at=CURRENT_TIMESTAMP WHERE id=?", hash, id)
+	return err
 }
 
 func (s *Store) ResetUserData(id int64) error {

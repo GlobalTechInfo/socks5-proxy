@@ -889,8 +889,18 @@ func (s *ProxyServer) authenticateUser(conn net.Conn, cfg *Config) (*User, error
 				return nil, fmt.Errorf("user %s is disabled", string(username))
 			}
 
-			// Constant-time password comparison
-			if subtle.ConstantTimeCompare(password, []byte(user.PasswordHash)) == 1 {
+			if ok, legacy := VerifyPassword(user.PasswordHash, string(password)); ok {
+				// A row from before hashing matched in the clear. Rewrite it now
+				// that the password has been proven, so the install tidies
+				// itself up one login at a time.
+				if legacy {
+					if hash, herr := HashPassword(string(password)); herr == nil {
+						if uerr := s.store.UpgradeUserPassword(user.ID, hash); uerr != nil {
+							s.logger.Warn("could not upgrade a stored password hash",
+								"user", user.Username, "error", uerr)
+						}
+					}
+				}
 				if _, err := conn.Write([]byte{socksAuthVersion, authStatusSuccess}); err != nil {
 					return nil, fmt.Errorf("write auth success: %w", err)
 				}
