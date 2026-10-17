@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -28,7 +29,7 @@ import (
 
 // version is reported by the version subcommand, /health and /api/stats, so the
 // three can never disagree.
-const version = "1.3.0"
+const version = "1.3.1"
 
 type Config struct {
 	ProxyPort    int      `json:"proxy_port"`
@@ -88,10 +89,17 @@ type Config struct {
 	RealityPublicHost  string   `json:"reality_public_host"`
 	RealityXrayBin     string   `json:"reality_xray_bin"`
 	RealityClientFile  string   `json:"reality_client_file"`
+
+	// envSet records which settings were explicitly provided through the
+	// environment, so applyDBOverrides knows not to overwrite the operator's
+	// stated intent with a value saved from the dashboard months earlier.
+	// Unexported, so it never appears in JSON and never reaches an API.
+	envSet map[string]bool
 }
 
 func DefaultConfig() Config {
 	return Config{
+		envSet:       make(map[string]bool),
 		ProxyPort:    1080,
 		AdminPort:    8080,
 		MetricsPort:  9090,
@@ -124,6 +132,9 @@ func LoadConfig(filename string) (Config, error) {
 	if err != nil {
 		return cfg, fmt.Errorf("read config %s: %w", filename, err)
 	}
+	if cfg.envSet == nil {
+		cfg.envSet = make(map[string]bool)
+	}
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		return cfg, fmt.Errorf("parse config: %w", err)
 	}
@@ -150,38 +161,48 @@ func LoadConfig(filename string) (Config, error) {
 		}
 	}
 	if user := os.Getenv("PROXY_USER"); user != "" {
+		cfg.envSet["proxy_user"] = true
 		cfg.Username = user
 	}
 	if pass := os.Getenv("PROXY_PASS"); pass != "" {
+		cfg.envSet["proxy_pass"] = true
 		cfg.Password = pass
 	}
 	if max := os.Getenv("MAX_CONNECTIONS"); max != "" {
+		cfg.envSet["max_connections"] = true
 		if m, err := strconv.Atoi(max); err == nil && m > 0 {
 			cfg.MaxConns = m
 		}
 	}
 
 	if v := os.Getenv("AUTH_ENABLED"); v != "" {
+		cfg.envSet["auth_enabled"] = true
 		cfg.AuthEnabled = v == "true" || v == "1"
 	}
 
 	// Admin auth env vars
 	if user := os.Getenv("ADMIN_USER"); user != "" {
+		cfg.envSet["admin_username"] = true
 		cfg.AdminUser = user
 	}
 	if pass := os.Getenv("ADMIN_PASS"); pass != "" {
+		cfg.envSet["admin_pass"] = true
 		cfg.AdminPass = pass
 	}
 	if v := os.Getenv("ADMIN_AUTH_ENABLED"); v != "" {
+		cfg.envSet["admin_auth_enabled"] = true
 		cfg.AdminEnabled = v == "true" || v == "1"
 	}
 	if v := os.Getenv("SECURITY_HEADERS_ENABLED"); v != "" {
+		cfg.envSet["security_headers_enabled"] = true
 		cfg.SecurityHeadersEnabled = v == "true" || v == "1"
 	}
 	if v := os.Getenv("RATE_LIMIT_ENABLED"); v != "" {
+		cfg.envSet["rate_limit_enabled"] = true
 		cfg.RateLimitEnabled = v == "true" || v == "1"
 	}
 	if v := os.Getenv("RATE_LIMIT_RPS"); v != "" {
+		cfg.envSet["rate_limit_rps"] = true
 		if r, err := strconv.Atoi(v); err == nil && r > 0 {
 			cfg.RateLimitRPS = r
 		}
@@ -491,11 +512,11 @@ type ProxyServer struct {
 	wg     sync.WaitGroup
 
 	// Rate limiter (shared reference for runtime updates)
-	limiter *rateLimiter
+	limiter *rateLimiterSet
 
 	// Separate limiter for tunnel handshakes, so token brute-force cannot
 	// exhaust the admin/dashboard budget (see multiplex.go)
-	tunnelLimiter *rateLimiter
+	tunnelLimiter *rateLimiterSet
 
 	// Client used for absolute-URI forward-proxy requests (http:// targets).
 	// Initialised with the mux; nil in multi-port mode, where forward proxying
@@ -961,9 +982,18 @@ func (s *ProxyServer) relay(client, target net.Conn, log *slog.Logger, targetAdd
 	var bytesUp, bytesDown atomic.Int64
 	wg.Add(2)
 
+	// The tier's bandwidth limit, one pacer per direction. A nil pacer (the
+	// Unlimited tier, or an unauthenticated session) means full speed and costs
+	// nothing to check.
+	var upPacer, downPacer *pacer
+	if user != nil {
+		upPacer = newPacer(user.BandwidthMbps)
+		downPacer = newPacer(user.BandwidthMbps)
+	}
+
 	go func() {
 		defer wg.Done()
-		n, err := io.Copy(target, client)
+		n, err := copyPaced(target, client, upPacer)
 		if err != nil && !isClosedConnError(err) {
 			log.Debug("client->target copy error", "error", err)
 		}
@@ -973,7 +1003,7 @@ func (s *ProxyServer) relay(client, target net.Conn, log *slog.Logger, targetAdd
 
 	go func() {
 		defer wg.Done()
-		n, err := io.Copy(client, target)
+		n, err := copyPaced(client, target, downPacer)
 		if err != nil && !isClosedConnError(err) {
 			log.Debug("target->client copy error", "error", err)
 		}
@@ -1111,15 +1141,128 @@ func (rl *rateLimiter) allow() bool {
 	return true
 }
 
-func rateLimit(limiter *rateLimiter) func(http.Handler) http.Handler {
+func rateLimit(limiter *rateLimiterSet) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if !limiter.allow() {
+			if !limiter.allow(requestIP(r)) {
 				http.Error(w, "Rate limit exceeded", http.StatusTooManyRequests)
 				return
 			}
 			next.ServeHTTP(w, r)
 		})
+	}
+}
+
+// ─── Per-client rate limiting ───────────────────────────────────────────────
+
+// rateLimiterSet gives every client its own token bucket.
+//
+// A single shared bucket, which is what this used to be, means one noisy client
+// spends everyone's budget: on a dashboard polled by two administrators, or on
+// a tunnel shared by a dozen phones behind one carrier NAT, a flood from one
+// address throttles all of them. That is also what the README claimed did not
+// happen, so the docs and the code now agree in the direction of the code being
+// useful.
+//
+// The cost is memory proportional to the number of distinct addresses seen in
+// the last rateLimiterIdle window, which is why buckets are swept rather than
+// kept forever.
+type rateLimiterSet struct {
+	mu        sync.Mutex
+	rps       int
+	buckets   map[string]*rateBucket
+	lastSweep time.Time
+}
+
+type rateBucket struct {
+	tokens   float64
+	last     time.Time
+	lastSeen time.Time
+}
+
+const (
+	// rateLimiterSweep is how often idle buckets are collected.
+	rateLimiterSweep = 5 * time.Minute
+	// rateLimiterIdle is how long a silent client's bucket is kept. Two sweeps,
+	// so a client that is quiet for one interval keeps its accumulated tokens.
+	rateLimiterIdle = 10 * time.Minute
+	// rateLimiterMaxBuckets bounds memory if a flood of distinct addresses
+	// arrives faster than the sweep removes them.
+	rateLimiterMaxBuckets = 100000
+)
+
+func newRateLimiterSet(rps int) *rateLimiterSet {
+	return &rateLimiterSet{
+		rps:       rps,
+		buckets:   make(map[string]*rateBucket),
+		lastSweep: time.Now(),
+	}
+}
+
+func (s *rateLimiterSet) allow(key string) bool {
+	now := time.Now()
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if now.Sub(s.lastSweep) >= rateLimiterSweep {
+		s.sweepLocked(now)
+	}
+
+	b, ok := s.buckets[key]
+	if !ok {
+		b = &rateBucket{tokens: float64(s.rps), last: now}
+		s.buckets[key] = b
+	}
+
+	elapsed := now.Sub(b.last).Seconds()
+	b.last = now
+	b.lastSeen = now
+	b.tokens += elapsed * float64(s.rps)
+	if b.tokens > float64(s.rps) {
+		b.tokens = float64(s.rps)
+	}
+	if b.tokens < 1 {
+		return false
+	}
+	b.tokens--
+	return true
+}
+
+func (s *rateLimiterSet) setRPS(rps int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.rps = rps
+	for _, b := range s.buckets {
+		if b.tokens > float64(rps) {
+			b.tokens = float64(rps)
+		}
+	}
+}
+
+// sweepLocked drops buckets nobody has used, and if that is not enough, the
+// least recently used half. Callers must hold the lock.
+func (s *rateLimiterSet) sweepLocked(now time.Time) {
+	s.lastSweep = now
+	for key, b := range s.buckets {
+		if now.Sub(b.lastSeen) > rateLimiterIdle {
+			delete(s.buckets, key)
+		}
+	}
+	if len(s.buckets) <= rateLimiterMaxBuckets {
+		return
+	}
+	type entry struct {
+		key      string
+		lastSeen time.Time
+	}
+	entries := make([]entry, 0, len(s.buckets))
+	for key, b := range s.buckets {
+		entries = append(entries, entry{key, b.lastSeen})
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].lastSeen.Before(entries[j].lastSeen) })
+	for _, e := range entries[:len(entries)/2] {
+		delete(s.buckets, e.key)
 	}
 }
 
@@ -1587,7 +1730,7 @@ func (s *ProxyServer) adminHandler() http.Handler {
 
 	// Apply middleware stack (outermost first)
 	if s.cfg.RateLimitEnabled {
-		s.limiter = newRateLimiter(s.cfg.RateLimitRPS)
+		s.limiter = newRateLimiterSet(s.cfg.RateLimitRPS)
 		handler = rateLimit(s.limiter)(handler)
 	}
 	if s.cfg.AdminEnabled && s.cfg.AdminUser != "" && s.cfg.AdminPass != "" {
@@ -1695,6 +1838,67 @@ func (s *ProxyServer) metricsHandler() http.Handler {
 	return handler
 }
 
+// applyDBOverrides applies settings saved from the admin dashboard.
+//
+// The environment wins. Both the docs and every deployment since the beginning
+// have said "edit config.json or use environment variables", so a password
+// edited in .env that silently kept working because a value happened to be
+// stored in SQLite three weeks earlier is a trap, not a feature. The dashboard
+// still wins over config.json, because the operator clicking "save" is stating
+// intent right now; the environment wins over the dashboard because it is how a
+// deployment is described at boot.
+//
+// Returns the keys that were actually applied, for the startup log.
+func applyDBOverrides(cfg *Config, dbCfg map[string]string) []string {
+	if len(dbCfg) == 0 {
+		return nil
+	}
+	var applied []string
+	take := func(key string, ok bool) bool {
+		if !ok || cfg.envSet[key] {
+			return false
+		}
+		applied = append(applied, key)
+		return true
+	}
+
+	if v, ok := dbCfg["max_connections"]; take("max_connections", ok) {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			cfg.MaxConns = n
+		}
+	}
+	if v, ok := dbCfg["proxy_user"]; take("proxy_user", ok) {
+		cfg.Username = v
+	}
+	if v, ok := dbCfg["proxy_pass"]; take("proxy_pass", ok) {
+		cfg.Password = v
+	}
+	if v, ok := dbCfg["auth_enabled"]; take("auth_enabled", ok) {
+		cfg.AuthEnabled = v == "true"
+	}
+	if v, ok := dbCfg["admin_auth_enabled"]; take("admin_auth_enabled", ok) {
+		cfg.AdminEnabled = v == "true"
+	}
+	if v, ok := dbCfg["admin_username"]; take("admin_username", ok) {
+		cfg.AdminUser = v
+	}
+	if v, ok := dbCfg["admin_pass"]; take("admin_pass", ok) {
+		cfg.AdminPass = v
+	}
+	if v, ok := dbCfg["security_headers_enabled"]; take("security_headers_enabled", ok) {
+		cfg.SecurityHeadersEnabled = v == "true"
+	}
+	if v, ok := dbCfg["rate_limit_enabled"]; take("rate_limit_enabled", ok) {
+		cfg.RateLimitEnabled = v == "true"
+	}
+	if v, ok := dbCfg["rate_limit_rps"]; take("rate_limit_rps", ok) {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			cfg.RateLimitRPS = n
+		}
+	}
+	return applied
+}
+
 // ─── Main ──────────────────────────────────────────────────────────────────
 
 func main() {
@@ -1758,42 +1962,10 @@ func runServer(logger *slog.Logger, configFile string) {
 
 	// Load persisted config overrides from DB
 	dbCfg := store.LoadConfig()
-	if len(dbCfg) > 0 {
-		if v, ok := dbCfg["max_connections"]; ok {
-			if n, err := strconv.Atoi(v); err == nil && n > 0 {
-				cfg.MaxConns = n
-			}
-		}
-		if v, ok := dbCfg["proxy_user"]; ok {
-			cfg.Username = v
-		}
-		if v, ok := dbCfg["proxy_pass"]; ok {
-			cfg.Password = v
-		}
-		if v, ok := dbCfg["auth_enabled"]; ok {
-			cfg.AuthEnabled = v == "true"
-		}
-		if v, ok := dbCfg["admin_auth_enabled"]; ok {
-			cfg.AdminEnabled = v == "true"
-		}
-		if v, ok := dbCfg["admin_username"]; ok {
-			cfg.AdminUser = v
-		}
-		if v, ok := dbCfg["admin_pass"]; ok {
-			cfg.AdminPass = v
-		}
-		if v, ok := dbCfg["security_headers_enabled"]; ok {
-			cfg.SecurityHeadersEnabled = v == "true"
-		}
-		if v, ok := dbCfg["rate_limit_enabled"]; ok {
-			cfg.RateLimitEnabled = v == "true"
-		}
-		if v, ok := dbCfg["rate_limit_rps"]; ok {
-			if n, err := strconv.Atoi(v); err == nil && n > 0 {
-				cfg.RateLimitRPS = n
-			}
-		}
-		logger.Info("loaded config overrides from database")
+	if applied := applyDBOverrides(&cfg, dbCfg); len(applied) > 0 {
+		logger.Info("loaded config overrides from database",
+			"keys", strings.Join(applied, ","),
+			"note", "keys set in the environment were left alone")
 	}
 
 	server := NewProxyServer(cfg)

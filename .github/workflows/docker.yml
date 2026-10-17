@@ -1,0 +1,93 @@
+# Builds the image on CI to prove the Dockerfile still works.
+#
+# This never pushes anywhere. There is no registry, no credentials and no tag to
+# manage: the only output is a build that either succeeds or fails, which is the
+# thing that was previously unverified. The xray download and its checksum are
+# the fragile part -- a moved release URL, a re-signed artifact or a changed
+# base image breaks the build -- and none of that shows up in `go test`.
+#
+# Single architecture on purpose. The Dockerfile resolves a different xray per
+# TARGETARCH, and verifying both on every run would double the build time to
+# re-check something that changes only when the pin does. Change the pin and
+# both paths are exercised by the local build on the target machine.
+
+name: Docker
+
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - "Dockerfile"
+      - ".dockerignore"
+      - "go.mod"
+      - "go.sum"
+      - "*.go"
+      - "web/**"
+      - ".github/workflows/docker.yml"
+  pull_request:
+    paths:
+      - "Dockerfile"
+      - ".dockerignore"
+      - "go.mod"
+      - "go.sum"
+      - "*.go"
+      - "web/**"
+      - ".github/workflows/docker.yml"
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build the image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          # load, not push: the image has to land in the local daemon so the
+          # smoke test below can run it. Nothing leaves the runner.
+          load: true
+          push: false
+          tags: socks5-proxy:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # A successful build says the image assembles. This says it runs: the
+      # health endpoint answers, and the diagnostics that used to identify a
+      # deployment are behind auth.
+      - name: Smoke test the image
+        run: |
+          set -euo pipefail
+          docker run -d --name ci-test -p 18080:8080 socks5-proxy:ci
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:18080/health >/dev/null 2>&1; then break; fi
+            if [ "$i" = "30" ]; then
+              echo "server never became healthy; container log:"
+              docker logs ci-test
+              exit 1
+            fi
+            sleep 1
+          done
+          echo "  /health:      $(curl -fsS http://127.0.0.1:18080/health)"
+          health=$(curl -fsS http://127.0.0.1:18080/health)
+          case "$health" in
+            *version*|*uptime*) echo "FAIL: /health leaks version or uptime: $health"; exit 1 ;;
+          esac
+          code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:18080/metrics)
+          echo "  /metrics:     $code (want 401 without credentials)"
+          if [ "$code" != "401" ]; then
+            echo "FAIL: the metrics dashboard is reachable without credentials"
+            exit 1
+          fi
+          # xray must be present in the image even with REALITY disabled,
+          # otherwise enabling it on a real host fails at startup.
+          docker exec ci-test xray version | head -1
+          docker rm -f ci-test
