@@ -7,6 +7,7 @@ Deploys on any PaaS, including the ones that expose only a single HTTP endpoint.
 ## Features
 
 - **SOCKS5 Protocol** - Full SOCKS5 proxy support with username/password authentication
+- **SOCKS5 UDP** - `UDP ASSOCIATE` relay for Telegram, QUIC and DNS-over-UDP, on the SOCKS5 port and through REALITY
 - **Single-Port Multiplexing** - SOCKS5, TLS, dashboards and the tunnel share one port, so it runs on Render/Koyeb/Heroku/Northflank where raw TCP never reaches the app
 - **WebSocket Tunnel** - Carries SOCKS5 over an HTTP upgrade for platforms whose edge terminates TLS; ships with a matching client
 - **REALITY** - Xray front door that presents a real website's certificate to an active prober; sessions still land in the SOCKS5 pipeline
@@ -139,6 +140,7 @@ separately on port 443 via xray.
 | Protocol | Endpoint | Used by |
 |---|---|---|
 | **SOCKS5** | `:1080` | Native SOCKS5 clients, on hosts that permit raw TCP |
+| **SOCKS5 UDP** | `:1080` | `UDP ASSOCIATE` for Telegram, QUIC and UDP DNS |
 | **SOCKS5 over WebSocket** | `/api/v1/tunnel` | SOCKS5 clients where raw TCP is blocked, via the bundled client |
 | **HTTP proxy** — `CONNECT` and absolute-form | single port | Browsers and any HTTP client with proxy support |
 | **HTTPS** | single port | TLS-wrapped access to any of the above |
@@ -152,6 +154,26 @@ Cloudflare's edge answers `CONNECT` with `400 Bad Request` without forwarding it
 to the origin, so HTTP proxying requires a directly reachable host. The
 WebSocket tunnel is unaffected and is the intended path on Render, Koyeb, Heroku
 and Northflank.
+
+## UDP
+
+The SOCKS5 port speaks `UDP ASSOCIATE`, so Telegram, QUIC and DNS-over-UDP work
+without anything special on the client. It needs no configuration; the relay
+picks an ephemeral port, tells the client about it, and opens one socket per
+destination as datagrams need it. The TCP control connection is the lifetime of
+the association: close it and the relay tears down.
+
+UDP flows through REALITY too, so the generated `reality-client.json` offers it.
+
+```bash
+# a DNS query over UDP, through the proxy on 127.0.0.1:1080
+dig @8.8.8.8 example.com +tcp=no +proxy
+```
+
+Two limits worth knowing: the WebSocket tunnel is TCP-only, so a client on the
+tunnel gets TCP only. And a client that asks to be told an address of `0.0.0.0`
+must send to the proxy host it is already connected to, which every mainstream
+SOCKS5 client does.
 
 ## Why the tunnel exists
 
@@ -328,7 +350,9 @@ What is still true after all of the above:
   fingerprinted behind it.
 - **The camouflage site's certificate is only as good as its uptime.** If the
   target site is down or slow, handshakes suffer visibly.
-- **No SOCKS5 UDP.** Sessions are TCP only, so REALITY carries TCP too.
+- **UDP is not available through the WebSocket tunnel.** UDP works on the
+  SOCKS5 port and through REALITY, but the tunnel is a TCP-only stream, so a
+  client on the tunnel gets TCP only.
 
 ## Configuration
 
@@ -344,6 +368,7 @@ Edit `config.json` or use environment variables (env vars override config file):
 | `PROXY_USER` | changeme | SOCKS5 username, also the HTTP proxy user |
 | `PROXY_PASS` | changeme | SOCKS5 password, also the HTTP proxy password |
 | `AUTH_ENABLED` | true | Enable SOCKS5 and HTTP proxy authentication |
+| `UDP_ENABLED` | true | SOCKS5 `UDP ASSOCIATE`. Set false for TCP only |
 | `MAX_CONNECTIONS` | 1000 | Max simultaneous connections |
 | `ADMIN_USER` | admin | Admin dashboard username |
 | `ADMIN_PASS` | changeme | Admin dashboard password |
