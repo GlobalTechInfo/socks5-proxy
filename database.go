@@ -132,6 +132,16 @@ func (s *Store) migrate() error {
 			enabled INTEGER NOT NULL DEFAULT 1,
 			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 		)`,
+		// MTProto secrets for the Telegram front door. The stored value is the
+		// shareable form, dd followed by 32 hex characters, so it can be pasted
+		// into a phone without editing.
+		`CREATE TABLE IF NOT EXISTS mtproto_secrets (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			secret TEXT UNIQUE NOT NULL,
+			label TEXT NOT NULL DEFAULT '',
+			enabled INTEGER NOT NULL DEFAULT 1,
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+		)`,
 	}
 
 	for _, q := range queries {
@@ -747,6 +757,101 @@ func (s *Store) DeleteVlessClient(id int64) error {
 	defer s.mu.Unlock()
 
 	_, err := s.db.Exec("DELETE FROM vless_clients WHERE id=?", id)
+	return err
+}
+
+// ─── MTProto secrets ────────────────────────────────────────────────────────
+
+type MtprotoSecret struct {
+	ID        int64  `json:"id"`
+	Secret    string `json:"secret"`
+	Label     string `json:"label"`
+	Enabled   bool   `json:"enabled"`
+	CreatedAt string `json:"created_at"`
+}
+
+func (s *Store) CreateMtprotoSecret(secret, label string) (*MtprotoSecret, error) {
+	secret = strings.TrimSpace(strings.ToLower(secret))
+	if _, err := parseMTProtoSecret(secret); err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	res, err := s.db.Exec("INSERT INTO mtproto_secrets (secret, label) VALUES (?, ?)", secret, label)
+	s.mu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		return nil, err
+	}
+	return s.GetMtprotoSecret(id)
+}
+
+func (s *Store) GetMtprotoSecret(id int64) (*MtprotoSecret, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var sec MtprotoSecret
+	var enabled int
+	err := s.db.QueryRow("SELECT id, secret, label, enabled, created_at FROM mtproto_secrets WHERE id=?", id).
+		Scan(&sec.ID, &sec.Secret, &sec.Label, &enabled, &sec.CreatedAt)
+	if err != nil {
+		return nil, err
+	}
+	sec.Enabled = enabled != 0
+	return &sec, nil
+}
+
+func (s *Store) ListMtprotoSecrets() ([]MtprotoSecret, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	rows, err := s.db.Query("SELECT id, secret, label, enabled, created_at FROM mtproto_secrets ORDER BY id")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := []MtprotoSecret{}
+	for rows.Next() {
+		var sec MtprotoSecret
+		var enabled int
+		if err := rows.Scan(&sec.ID, &sec.Secret, &sec.Label, &enabled, &sec.CreatedAt); err != nil {
+			return nil, err
+		}
+		sec.Enabled = enabled != 0
+		out = append(out, sec)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) UpdateMtprotoSecret(id int64, label *string, enabled *bool) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if label != nil {
+		if _, err := s.db.Exec("UPDATE mtproto_secrets SET label=? WHERE id=?", *label, id); err != nil {
+			return err
+		}
+	}
+	if enabled != nil {
+		value := 0
+		if *enabled {
+			value = 1
+		}
+		if _, err := s.db.Exec("UPDATE mtproto_secrets SET enabled=? WHERE id=?", value, id); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Store) DeleteMtprotoSecret(id int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	_, err := s.db.Exec("DELETE FROM mtproto_secrets WHERE id=?", id)
 	return err
 }
 

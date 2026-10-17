@@ -261,6 +261,42 @@ document.addEventListener('DOMContentLoaded',function(){
 </div>
 
 <div class="section">
+  <h2>Telegram (MTProto)</h2>
+  <div class="form-box">
+    <div id="mtproto-msg" class="msg"></div>
+    <p style="color:#6b7280;font-size:13px;margin:0 0 12px">
+      Each secret is one Telegram client. Add one, then paste it into the phone
+      under Settings &rarr; Data and Storage &rarr; Proxy. Changes take effect at
+      once; nothing restarts.
+    </p>
+    <div class="form-grid">
+      <div class="field">
+        <label for="m-label">Label (whose phone is this?)</label>
+        <input type="text" id="m-label" placeholder="e.g. alice's phone">
+      </div>
+    </div>
+    <button class="btn btn-primary" onclick="createMtprotoSecret()">Add Secret</button>
+  </div>
+
+  <div class="table-wrap">
+    <table style="margin-top:16px">
+    <thead>
+      <tr>
+        <th>ID</th>
+        <th>Label</th>
+        <th>Secret</th>
+        <th>Status</th>
+        <th>Actions</th>
+      </tr>
+    </thead>
+    <tbody id="mtproto-body">
+      <tr><td colspan="5" style="color:#555">Loading...</td></tr>
+    </tbody>
+  </table>
+  </div>
+</div>
+
+<div class="section">
   <h2>REALITY Clients (VLESS UUIDs)</h2>
   <div class="form-box">
     <div id="vless-msg" class="msg"></div>
@@ -580,6 +616,98 @@ async function saveConfig(){
 
 function el(tag,text){var e=document.createElement(tag);if(text!==undefined)e.textContent=text;return e}
 
+async function loadMtprotoSecrets(){
+  var msg=document.getElementById('mtproto-msg');
+  var tbody=document.getElementById('mtproto-body');
+  try{
+    var r=await fetch('/api/mtproto-secrets',{credentials:'same-origin'});
+    var data=await r.json();
+    if(!data.mtproto_enabled){
+      tbody.innerHTML='';
+      var row=el('tr'),cell=el('td','MTPROTO_ENABLED is false, so there is no Telegram listener.');
+      cell.colSpan=5;cell.style.color='#555';
+      row.appendChild(cell);tbody.appendChild(row);
+      return;
+    }
+    tbody.innerHTML='';
+    if(!data.secrets||data.secrets.length===0){
+      var empty=el('tr'),ecell=el('td','No secrets yet. Add one above.');
+      ecell.colSpan=5;ecell.style.color='#555';
+      empty.appendChild(ecell);tbody.appendChild(empty);
+      return;
+    }
+    for(var i=0;i<data.secrets.length;i++){
+      var c=data.secrets[i];
+      var row=el('tr');
+      row.appendChild(el('td',String(c.id)));
+      row.appendChild(el('td',c.label||''));
+      var secretCell=el('td'),mono=el('span',c.secret);
+      mono.className='uuid';
+      secretCell.appendChild(mono);
+      var copy=el('button','Copy');
+      copy.className='btn btn-sm';
+      copy.style.marginLeft='8px';
+      copy.onclick=function(){navigator.clipboard.writeText(c.secret)};
+      secretCell.appendChild(copy);
+      row.appendChild(secretCell);
+      var status=el('td');
+      var badge=el('span',c.enabled?'active':'disabled');
+      badge.className='badge '+(c.enabled?'badge-active':'badge-disabled');
+      status.appendChild(badge);
+      row.appendChild(status);
+      var actions=el('td');
+      actions.className='actions';
+      var toggle=el('button',c.enabled?'Disable':'Enable');
+      toggle.className='btn btn-sm '+(c.enabled?'btn-danger':'btn-success');
+      toggle.onclick=function(){toggleMtprotoSecret(c.id,!c.enabled)};
+      var del=el('button','Del');
+      del.className='btn btn-sm btn-danger';
+      del.onclick=function(){deleteMtprotoSecret(c.id,c.label||c.secret)};
+      actions.appendChild(toggle);actions.appendChild(del);
+      row.appendChild(actions);
+      tbody.appendChild(row);
+    }
+  }catch(e){
+    msg.textContent='Could not load secrets: '+e.message;
+    msg.className='msg msg-err';msg.style.display='block';
+  }
+}
+
+async function createMtprotoSecret(){
+  var msg=document.getElementById('mtproto-msg');
+  var body={label:document.getElementById('m-label').value};
+  try{
+    var r=await fetch('/api/mtproto-secrets',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    if(r.ok){
+      var data=await r.json();
+      msg.textContent='Secret created. Paste it into Telegram: '+data.secret;
+      msg.className='msg msg-ok';msg.style.display='block';
+      document.getElementById('m-label').value='';
+      loadMtprotoSecrets();
+    }else{
+      msg.textContent='Error: '+(await r.text());
+      msg.className='msg msg-err';msg.style.display='block';
+    }
+  }catch(e){msg.textContent='Network error: '+e.message;msg.className='msg msg-err';msg.style.display='block'}
+}
+
+async function toggleMtprotoSecret(id,enabled){
+  var msg=document.getElementById('mtproto-msg');
+  var r=await fetch('/api/mtproto-secrets/'+id,{method:'PUT',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:enabled})});
+  if(!r.ok){msg.textContent='Error: '+(await r.text());msg.className='msg msg-err';msg.style.display='block'}
+  else{msg.style.display='none'}
+  loadMtprotoSecrets();
+}
+
+async function deleteMtprotoSecret(id,label){
+  if(!confirm('Delete "'+label+'"? That phone stops working immediately.'))return;
+  var msg=document.getElementById('mtproto-msg');
+  var r=await fetch('/api/mtproto-secrets/'+id,{method:'DELETE',credentials:'same-origin'});
+  if(!r.ok){msg.textContent='Error: '+(await r.text());msg.className='msg msg-err';msg.style.display='block'}
+  else{msg.style.display='none'}
+  loadMtprotoSecrets();
+}
+
 async function loadVlessClients(){
   var msg=document.getElementById('vless-msg');
   var tbody=document.getElementById('vless-body');
@@ -684,6 +812,7 @@ renderTimeline();
 poll();
 pollHistory();
 loadUsers();
+loadMtprotoSecrets();
 loadVlessClients();
 loadConfig();
 setInterval(poll,2000);

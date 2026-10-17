@@ -11,6 +11,7 @@ Deploys on any PaaS, including the ones that expose only a single HTTP endpoint.
 - **Single-Port Multiplexing** - SOCKS5, TLS, dashboards and the tunnel share one port, so it runs on Render/Koyeb/Heroku/Northflank where raw TCP never reaches the app
 - **WebSocket Tunnel** - Carries SOCKS5 over an HTTP upgrade for platforms whose edge terminates TLS; ships with a matching client
 - **REALITY** - Xray front door that presents a real website's certificate to an active prober; sessions still land in the SOCKS5 pipeline
+- **MTProto** - Telegram's own protocol on its own port, with per-phone secrets managed in the dashboard
 - **VLESS Client Management** - Add, disable and revoke REALITY UUIDs from the dashboard; xray is reloaded in place, no restart
 - **Client Mode** - Same binary exposes a local SOCKS5 port that relays through the tunnel
 - **User Management** - Create, update, delete users with tier-based limits
@@ -147,6 +148,7 @@ separately on port 443 via xray.
 | **HTTP proxy** — `CONNECT` and absolute-form | single port | Browsers and any HTTP client with proxy support |
 | **HTTPS** | single port | TLS-wrapped access to any of the above |
 | **VLESS + REALITY** | `:443` via xray | Clients on a VPS where the front door must look like a website |
+| **MTProto** | `$MTPROTO_BIND` (default `:8443`) | Telegram, which speaks neither SOCKS5 nor HTTP |
 
 Authentication is username/password throughout, taken from `PROXY_USER` and
 `PROXY_PASS` for the proxy protocols, and `ADMIN_USER`/`ADMIN_PASS` for the
@@ -176,6 +178,26 @@ Two limits worth knowing: the WebSocket tunnel is TCP-only, so a client on the
 tunnel gets TCP only. And a client that asks to be told an address of `0.0.0.0`
 must send to the proxy host it is already connected to, which every mainstream
 SOCKS5 client does.
+
+## Telegram (MTProto)
+
+Telegram does not speak SOCKS5 or HTTP, so it needs a front door of its own.
+Set `MTPROTO_ENABLED=true`, leave the first secret to be generated, and paste it
+into the phone: **Settings → Data and Storage → Proxy**.
+
+Each secret is one phone. The dashboard's **Telegram** panel adds, disables and
+revokes them, and a change applies immediately — a revoked phone stops working
+at once, with no restart.
+
+This is obfuscated2 (the `dd` secret Telegram apps expect). Two honest limits:
+
+- **The camouflage here is Telegram's, not ours.** The transport looks like
+  random bytes, which is what every Telegram proxy looks like on the wire. If you
+  need the port to look like a website to an active prober, that is REALITY's
+  job — and Telegram does not speak VLESS.
+- **Telegram's addresses are compiled in**, which is what every MTProxy does.
+  If they are unreachable from your network, `MTPROTO_DCS` points them
+  somewhere else.
 
 ## Why the tunnel exists
 
@@ -377,6 +399,9 @@ Edit `config.json` or use environment variables (env vars override config file):
 | `PROXY_PASS` | changeme | SOCKS5 password, also the HTTP proxy password |
 | `AUTH_ENABLED` | true | Enable SOCKS5 and HTTP proxy authentication |
 | `UDP_ENABLED` | true | SOCKS5 `UDP ASSOCIATE`. Set false for TCP only |
+| `MTPROTO_ENABLED` | false | Telegram front door; generates its first secret on first start |
+| `MTPROTO_BIND` | 0.0.0.0:8443 | Telegram port. Avoid 443 when REALITY has it |
+| `MTPROTO_DCS` | unset | `dc=address,dc=address`, only when Telegram's own addresses are unreachable |
 | `MAX_CONNECTIONS` | 1000 | Max simultaneous connections |
 | `ADMIN_USER` | admin | Admin dashboard username |
 | `ADMIN_PASS` | changeme | Admin dashboard password |
@@ -462,9 +487,9 @@ socks5-proxy restore -in socks5-20261017.tar.gz
 
 The archive holds `socks5.db`, `config.json` and, when REALITY is enabled,
 `reality-client.json`. **Restoring the same archive keeps every REALITY client
-working**, because the keypair travels with it and the managed VLESS UUIDs live
-in the database; restoring an older or different one invalidates every client you
-have imported.
+working**, because the keypair travels with it and the managed VLESS UUIDs and
+MTProto secrets live in the database; restoring an older or different one
+invalidates every client you have imported.
 
 `restore` refuses to run while the server is up, because replacing a database
 that another process still has open is how SQLite ends up cleaning up the wrong
@@ -611,6 +636,10 @@ at `/prometheus` with `basic_auth` configured.
 | PUT | `/api/users/:id` | Update user |
 | DELETE | `/api/users/:id` | Delete user |
 | POST | `/api/users/:id/reset` | Reset a user's data usage |
+| GET | `/api/mtproto-secrets` | Telegram secrets, with the listener's bind address |
+| POST | `/api/mtproto-secrets` | Add a secret; it is generated for you |
+| PUT | `/api/mtproto-secrets/:id` | Relabel, or enable/disable, a secret |
+| DELETE | `/api/mtproto-secrets/:id` | Revoke a phone, effective immediately |
 | GET | `/api/vless-clients` | REALITY client UUIDs, and whether they can be managed |
 | POST | `/api/vless-clients` | Add a client; the UUID is generated if omitted |
 | PUT | `/api/vless-clients/:id` | Relabel, or enable/disable, a client |
