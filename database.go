@@ -30,7 +30,29 @@ func NewStore(dbPath string, logger *slog.Logger) (*Store, error) {
 		}
 	}
 
-	db, err := sql.Open("sqlite", dbPath+"?_journal_mode=WAL&_busy_timeout=5000&_synchronous=NORMAL&_foreign_keys=ON")
+	// Pragma syntax matters here. The driver is modernc.org/sqlite, which takes
+	// `_pragma=name(value)`; the `_journal_mode=WAL` form belongs to
+	// mattn/go-sqlite3 and is silently ignored by this one.
+	//
+	// That was not a cosmetic mistake. Every one of these was being dropped on
+	// the floor, and each has a consequence:
+	//
+	//   journal_mode  was "delete", not WAL: readers blocked the writer and
+	//                  the newest writes could sit in a rollback journal that a
+	//                  naive file copy would miss.
+	//   busy_timeout  was 0, so a concurrent write returned SQLITE_BUSY
+	//                  immediately instead of waiting the intended 5s.
+	//   foreign_keys  was OFF, so `user_connections` could reference a deleted
+	//                  user and nothing complained.
+	//   synchronous   was FULL (2), not NORMAL: an extra fsync per commit for
+	//                  no benefit on a volume that is not a single-disk array.
+	//
+	// Verified with PRAGMA journal_mode on both spellings rather than assumed.
+	db, err := sql.Open("sqlite", dbPath+
+		"?_pragma=journal_mode(WAL)"+
+		"&_pragma=busy_timeout(5000)"+
+		"&_pragma=foreign_keys(1)"+
+		"&_pragma=synchronous(NORMAL)")
 	if err != nil {
 		return nil, fmt.Errorf("open database: %w", err)
 	}
@@ -522,12 +544,29 @@ func (s *Store) UpdateUser(id int64, tier *string, password *string, enabled *bo
 	return nil
 }
 
+// DeleteUser removes an account and everything recorded against it.
+//
+// The children go first, in one transaction. Foreign keys are now actually
+// enforced (see NewStore), so deleting the parent with connection history
+// still attached would fail with a constraint error and leave the operator
+// unable to remove a user through the dashboard.
 func (s *Store) DeleteUser(id int64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	_, err := s.db.Exec("DELETE FROM users WHERE id=?", id)
-	return err
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec("DELETE FROM user_connections WHERE user_id = ?", id); err != nil {
+		return err
+	}
+	if _, err := tx.Exec("DELETE FROM users WHERE id = ?", id); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (s *Store) ResetUserData(id int64) error {
