@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -1917,6 +1918,18 @@ func main() {
 				os.Exit(1)
 			}
 			return
+		case "backup":
+			if err := runBackup(os.Args[2:]); err != nil {
+				logger.Error("backup failed", "error", err)
+				os.Exit(1)
+			}
+			return
+		case "restore":
+			if err := runRestore(os.Args[2:]); err != nil {
+				logger.Error("restore failed", "error", err)
+				os.Exit(1)
+			}
+			return
 		case "reality-client":
 			if err := runRealityClient(os.Args[2:]); err != nil {
 				logger.Error("reality client failed", "error", err)
@@ -1959,6 +1972,14 @@ func runServer(logger *slog.Logger, configFile string) {
 		os.Exit(1)
 	}
 	defer store.Close()
+
+	// Publish the pid so `restore` can refuse to overwrite a database a live
+	// server still has open. Best effort: a data directory that will not take
+	// the file must not stop the proxy from starting.
+	if err := writePidFile(filepath.Dir(dbPath)); err != nil {
+		logger.Warn("could not write pid file; `restore` will not detect a running server", "error", err)
+	}
+	defer removePidFile(filepath.Dir(dbPath))
 
 	// Load persisted config overrides from DB
 	dbCfg := store.LoadConfig()

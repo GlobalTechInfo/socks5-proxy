@@ -410,6 +410,47 @@ Client flags: `-url` (required; `https://` is accepted and mapped to `wss://`, a
 
 `reality-client` flags: `-config` (default `reality-client.json`), `-server` (override the server address, `host` or `host:port`), `-listen` (override the local SOCKS5 address, default `127.0.0.1:1081`), `-bin` (xray binary).
 
+## Backup and restore
+
+```bash
+# Take a backup. Works while the server is running.
+socks5-proxy backup -out socks5-20261017.tar.gz
+
+# Encrypt it. A backup contains every user password and, with REALITY enabled,
+# the private key -- so encryption is worth the passphrase.
+socks5-proxy backup -out socks5-20261017.tar.gz -passphrase 'a good passphrase'
+
+# Look inside without restoring anything.
+socks5-proxy restore -in socks5-20261017.tar.gz -list
+
+# Restore. Stop the server first.
+socks5-proxy restore -in socks5-20261017.tar.gz
+```
+
+The archive holds `socks5.db`, `config.json` and, when REALITY is enabled,
+`reality-client.json`. **Restoring the same archive keeps every REALITY client
+working**, because the keypair travels with it; restoring an older or different
+one invalidates every client you have imported.
+
+`restore` refuses to run while the server is up, because replacing a database
+that another process still has open is how SQLite ends up cleaning up the wrong
+file. It detects that through a pid file the server writes at startup, and a pid
+left behind by a crash does not count as running. `-force` overrides it.
+
+The current database is kept as `socks5.db.pre-restore-<timestamp>` before
+anything is replaced, so a restore is undoable by hand.
+
+Snapshots are taken with SQLite's `VACUUM INTO`, never by copying the file.
+This database runs in WAL mode, so the most recent commits live in the `-wal`
+sidecar: a file copy can produce a backup that restores cleanly and silently
+loses data.
+
+Nightly, with the volume mounted:
+
+```bash
+0 3 * * * cd /srv/socks5-proxy && ./socks5-proxy backup -out "backup-$(date +%F).tar.gz" -passphrase "$BACKUP_PASSPHRASE" && find . -name 'backup-*.tar.gz' -mtime +14 -delete
+```
+
 ## Tests
 
 ```bash
@@ -452,6 +493,9 @@ go test -run TestRealityEndToEnd -v ./...   # needs xray on PATH
   on shutdown. Its own log lines are relayed into this server's log.
 - `whitelist` and `blacklist` apply to the SOCKS5 port, the HTTP proxy
   (`CONNECT` and forward) and the tunnel alike.
+- A backup contains every user password in the clear, plus the REALITY private
+  key when it is enabled. Use `-passphrase` for anything that leaves the machine,
+  and keep the passphrase somewhere other than the backup directory.
 - `/health` is the only endpoint reachable without admin credentials, and it
   returns `{"status":"ok"}` with no uptime or version: on a public port it is
   the one thing a scanner can read, so it says nothing. `/metrics`,
