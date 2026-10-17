@@ -211,6 +211,11 @@ func TestRenderRealityClientConfig(t *testing.T) {
 	if out.Inbounds[0].Listen != "127.0.0.1" || out.Inbounds[0].Port != 1081 {
 		t.Errorf("socks inbound = %s:%d, want 127.0.0.1:1081", out.Inbounds[0].Listen, out.Inbounds[0].Port)
 	}
+	// UDP is the whole point for Telegram and QUIC. A generated config that
+	// leaves it off silently degrades the client to TCP-only.
+	if !out.Inbounds[0].Settings.UDP {
+		t.Error("generated socks inbound must accept UDP")
+	}
 
 	if len(out.Outbounds) != 1 || out.Outbounds[0].Protocol != "vless" {
 		t.Fatalf("client config needs a vless outbound, got %+v", out.Outbounds)

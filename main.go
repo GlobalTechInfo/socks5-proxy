@@ -77,6 +77,11 @@ type Config struct {
 	TLSCertFile string `json:"tls_cert_file"`
 	TLSKeyFile  string `json:"tls_key_file"`
 
+	// SOCKS5 UDP ASSOCIATE. TCP-only was the original behaviour, and a proxy
+	// that cannot carry UDP breaks DNS lookups and QUIC unless the client falls
+	// back. The WebSocket tunnel is TCP-only by nature and cannot offer it.
+	UDPEnabled bool `json:"udp_enabled"`
+
 	// REALITY front door: Xray terminates VLESS+REALITY and forwards sessions to
 	// the SOCKS5 port, so users and tiers keep applying. Needs a dedicated IP
 	// with raw TCP; a CDN edge would terminate TLS before reaching us.
@@ -119,6 +124,7 @@ func DefaultConfig() Config {
 		TunnelPath:             "/api/v1/tunnel",
 		TunnelPadding:          256,
 		TunnelRateRPS:          5,
+		UDPEnabled:             true,
 		RealityBind:            defaultRealityBind,
 		RealityDest:            defaultRealityDest,
 		RealityXrayBin:         "xray",
@@ -271,6 +277,10 @@ func LoadConfig(filename string) (Config, error) {
 		cfg.TLSKeyFile = v
 	}
 
+	if v := os.Getenv("UDP_ENABLED"); v != "" {
+		cfg.UDPEnabled = v == "true" || v == "1"
+	}
+
 	// REALITY. Comma-separated lists accept more than one SNI, short id or
 	// VLESS id so a rotation does not need a restart.
 	if v := os.Getenv("REALITY_ENABLED"); v != "" {
@@ -420,7 +430,8 @@ const (
 	methodUserPassword = 0x02
 	methodNoAcceptable = 0xFF
 
-	cmdConnect = 0x01
+	cmdConnect      = 0x01
+	cmdUDPAssociate = 0x03
 
 	addrTypeIPv4 = 0x01
 	addrTypeFQDN = 0x03
@@ -696,10 +707,31 @@ func (s *ProxyServer) handleClient(conn net.Conn, clientIPOverride string) {
 
 	// Step 3: Read CONNECT request
 	conn.SetReadDeadline(time.Now().Add(time.Duration(cfgSnap.ReadTimeout) * time.Second))
-	target, err := s.readRequest(conn, &cfgSnap)
+	target, command, err := s.readRequest(conn, &cfgSnap)
 	if err != nil {
 		log.Error("request read failed", "error", err)
 		metricConnErrors.WithLabelValues("request_read").Inc()
+		return
+	}
+
+	if command == cmdUDPAssociate {
+		// readRequest already consumed the address the client suggested. This
+		// relay always picks its own ephemeral port and reports that back, which
+		// is both simpler and more correct: the suggestion is advisory and is
+		// frequently wrong on a host with several interfaces.
+		if !cfgSnap.UDPEnabled {
+			log.Warn("udp associate refused: udp_enabled is false")
+			s.sendReply(conn, replyCmdNotSupported, &cfgSnap)
+			return
+		}
+		// Tier limits apply here too: an association is a session, and a
+		// Free-tier account should not be able to open unlimited UDP targets.
+		if !s.userAllowedUDP(authenticatedUser, log) {
+			s.sendReply(conn, replyConnNotAllowed, &cfgSnap)
+			return
+		}
+		log.Info("udp association requested", "suggested_addr", target)
+		s.relayUDP(conn, log, &cfgSnap, authenticatedUser)
 		return
 	}
 
@@ -888,19 +920,20 @@ func (s *ProxyServer) authenticateUser(conn net.Conn, cfg *Config) (*User, error
 	return nil, errors.New("invalid credentials")
 }
 
-func (s *ProxyServer) readRequest(conn net.Conn, cfg *Config) (string, error) {
+func (s *ProxyServer) readRequest(conn net.Conn, cfg *Config) (string, byte, error) {
 	header := make([]byte, 4)
 	if _, err := io.ReadFull(conn, header); err != nil {
-		return "", fmt.Errorf("read request header: %w", err)
+		return "", 0, fmt.Errorf("read request header: %w", err)
 	}
 
 	if header[0] != socksVersion {
-		return "", fmt.Errorf("unsupported SOCKS version: %d", header[0])
+		return "", 0, fmt.Errorf("unsupported SOCKS version: %d", header[0])
 	}
-	if header[1] != cmdConnect {
+	if header[1] != cmdConnect && header[1] != cmdUDPAssociate {
 		s.sendReply(conn, replyCmdNotSupported, cfg)
-		return "", fmt.Errorf("unsupported command: %d", header[1])
+		return "", 0, fmt.Errorf("unsupported command: %d", header[1])
 	}
+	command := header[1]
 
 	var host string
 	var port uint16
@@ -909,7 +942,7 @@ func (s *ProxyServer) readRequest(conn net.Conn, cfg *Config) (string, error) {
 	case addrTypeIPv4:
 		addr := make([]byte, 6)
 		if _, err := io.ReadFull(conn, addr); err != nil {
-			return "", fmt.Errorf("read IPv4 addr: %w", err)
+			return "", command, fmt.Errorf("read IPv4 addr: %w", err)
 		}
 		host = net.IPv4(addr[0], addr[1], addr[2], addr[3]).String()
 		port = binary.BigEndian.Uint16(addr[4:6])
@@ -917,34 +950,34 @@ func (s *ProxyServer) readRequest(conn net.Conn, cfg *Config) (string, error) {
 	case addrTypeFQDN:
 		lenBuf := make([]byte, 1)
 		if _, err := io.ReadFull(conn, lenBuf); err != nil {
-			return "", fmt.Errorf("read FQDN length: %w", err)
+			return "", command, fmt.Errorf("read FQDN length: %w", err)
 		}
 		domainLen := int(lenBuf[0])
 		domain := make([]byte, domainLen)
 		if _, err := io.ReadFull(conn, domain); err != nil {
-			return "", fmt.Errorf("read FQDN: %w", err)
+			return "", command, fmt.Errorf("read FQDN: %w", err)
 		}
 		host = string(domain)
 		portBuf := make([]byte, 2)
 		if _, err := io.ReadFull(conn, portBuf); err != nil {
-			return "", fmt.Errorf("read FQDN port: %w", err)
+			return "", command, fmt.Errorf("read FQDN port: %w", err)
 		}
 		port = binary.BigEndian.Uint16(portBuf)
 
 	case addrTypeIPv6:
 		addr := make([]byte, 18)
 		if _, err := io.ReadFull(conn, addr); err != nil {
-			return "", fmt.Errorf("read IPv6 addr: %w", err)
+			return "", command, fmt.Errorf("read IPv6 addr: %w", err)
 		}
 		host = net.IP(addr[:16]).String()
 		port = binary.BigEndian.Uint16(addr[16:18])
 
 	default:
 		s.sendReply(conn, replyAddrNotSupported, cfg)
-		return "", fmt.Errorf("unsupported address type: %d", header[3])
+		return "", command, fmt.Errorf("unsupported address type: %d", header[3])
 	}
 
-	return fmt.Sprintf("%s:%d", host, port), nil
+	return fmt.Sprintf("%s:%d", host, port), command, nil
 }
 
 func (s *ProxyServer) sendReply(conn net.Conn, reply byte, cfg *Config) error {

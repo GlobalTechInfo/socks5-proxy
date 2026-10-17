@@ -4,6 +4,7 @@
   "metrics_port": 9090,
   "max_connections": 1000,
   "auth_enabled": true,
+  "udp_enabled": true,
   "username": "changeme",
   "password": "changeme",
   "whitelist": [],

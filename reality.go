@@ -306,7 +306,7 @@ func renderRealityClientConfig(address string, port int, listen string, listenPo
 		Listen:   listen,
 		Port:     listenPort,
 		Protocol: "socks",
-		Settings: realitySocksInboundConfig{Auth: "noauth", UDP: false},
+		Settings: realitySocksInboundConfig{Auth: "noauth", UDP: true},
 	}}
 	out.Outbounds = []realityVLESSPtr{{
 		Protocol: "vless",
