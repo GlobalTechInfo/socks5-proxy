@@ -30,7 +30,7 @@ import (
 
 // version is reported by the version subcommand, /health and /api/stats, so the
 // three can never disagree.
-const version = "1.3.1"
+const version = "1.4.0"
 
 type Config struct {
 	ProxyPort    int      `json:"proxy_port"`
