@@ -336,8 +336,13 @@ func TestResolveRealityKeysPersistsGeneratedValues(t *testing.T) {
 	if saved[dbRealityShortID] != keys.ShortID {
 		t.Errorf("short id not persisted: %v", saved)
 	}
-	if saved[dbRealityClientIDs] != strings.Join(keys.ClientIDs, ",") {
-		t.Errorf("client ids not persisted: %v", saved)
+	// The uuid belongs in the managed table now, not in a comma-joined string.
+	clients, err := store.ListVlessClients()
+	if err != nil {
+		t.Fatalf("list clients: %v", err)
+	}
+	if len(clients) != 1 || clients[0].UUID != keys.ClientIDs[0] || !clients[0].Enabled {
+		t.Fatalf("generated uuid not stored as a managed client: %+v", clients)
 	}
 
 	// A restart must reuse the persisted pair rather than rotate it.
@@ -347,6 +352,9 @@ func TestResolveRealityKeysPersistsGeneratedValues(t *testing.T) {
 	}
 	if again.PrivateKey != keys.PrivateKey || again.ShortID != keys.ShortID {
 		t.Errorf("restart rotated the key material: %q/%q", again.PrivateKey, again.ShortID)
+	}
+	if len(again.ClientIDs) != 1 || again.ClientIDs[0] != keys.ClientIDs[0] {
+		t.Errorf("restart rotated the client id: %v, want %v", again.ClientIDs, keys.ClientIDs)
 	}
 }
 
@@ -383,7 +391,7 @@ func TestRealityRefusesWithoutXrayBinary(t *testing.T) {
 	cfg.RealityEnabled = true
 	cfg.RealityXrayBin = filepath.Join(t.TempDir(), "definitely-not-here")
 
-	_, err := startRealityForServer(cfg, nil, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	_, _, err := startRealityForServer(cfg, nil, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err == nil {
 		t.Fatal("starting REALITY without the xray binary should fail")
 	}

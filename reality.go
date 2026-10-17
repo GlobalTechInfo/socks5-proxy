@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -445,12 +446,22 @@ func resolveRealityKeys(cfg Config, persisted map[string]string, store *Store, l
 		keys.ShortID = hex.EncodeToString(raw)
 	}
 
+	// Client UUIDs, in precedence order:
+	//
+	// 1. REALITY_CLIENT_IDS. Configuration pinning always wins, which is the
+	//    same promise the rest of the environment handling makes.
+	// 2. The vless_clients table, which the dashboard manages.
+	// 3. The legacy comma-joined config value, adopted into the table on first
+	//    run so an upgrade does not revoke anyone's UUID.
+	// 4. A generated one, which becomes a table row so it survives a restart.
 	keys.ClientIDs = nonEmpty(cfg.RealityClientIDs)
-	if len(keys.ClientIDs) == 0 && persisted[dbRealityClientIDs] != "" {
-		keys.ClientIDs = splitList(persisted[dbRealityClientIDs])
+	if len(keys.ClientIDs) == 0 && store != nil {
+		keys.ClientIDs, _ = store.EnabledVlessClientUUIDs()
+		if len(keys.ClientIDs) == 0 && persisted[dbRealityClientIDs] != "" {
+			keys.ClientIDs = adoptLegacyClientIDs(store, splitList(persisted[dbRealityClientIDs]), logger)
+		}
 	}
-	generatedIDs := len(keys.ClientIDs) == 0
-	if generatedIDs {
+	if len(keys.ClientIDs) == 0 {
 		out, err := runXray(bin, "uuid")
 		if err != nil {
 			return keys, err
@@ -460,6 +471,13 @@ func resolveRealityKeys(cfg Config, persisted map[string]string, store *Store, l
 		}
 		if len(keys.ClientIDs) == 0 {
 			return keys, errors.New("xray uuid returned no id")
+		}
+		if store != nil {
+			// A UUID that changes on every restart would silently break every
+			// saved client profile, so the generated one is stored.
+			if _, err := store.CreateVlessClient(keys.ClientIDs[0], "generated"); err != nil {
+				logger.Warn("could not store the generated VLESS id; it will change on restart", "error", err)
+			}
 		}
 	}
 
@@ -478,12 +496,30 @@ func resolveRealityKeys(cfg Config, persisted map[string]string, store *Store, l
 		if generatedShortID {
 			saveRealitySetting(store, logger, dbRealityShortID, keys.ShortID)
 		}
-		if generatedIDs {
-			saveRealitySetting(store, logger, dbRealityClientIDs, strings.Join(keys.ClientIDs, ","))
-		}
 	}
 
 	return keys, nil
+}
+
+// adoptLegacyClientIDs moves an id list from the old comma-joined config value
+// into the table. Without this, the first dashboard change would drop the ids
+// that upgrade brought with it, because the table would then shadow the config.
+func adoptLegacyClientIDs(store *Store, ids []string, logger *slog.Logger) []string {
+	for _, id := range ids {
+		if !IsUUID(id) {
+			continue
+		}
+		if _, err := store.CreateVlessClient(id, "migrated"); err != nil {
+			logger.Warn("could not migrate a REALITY client id; it will be dropped from the managed list", "error", err)
+			continue
+		}
+	}
+	kept, err := store.EnabledVlessClientUUIDs()
+	if err != nil {
+		logger.Warn("could not read the migrated VLESS ids", "error", err)
+		return nil
+	}
+	return kept
 }
 
 func saveRealitySetting(store *Store, logger *slog.Logger, key, value string) {
@@ -566,48 +602,38 @@ func pruneStaleRealityConfigs(maxAge time.Duration) {
 
 // realityRunner owns the xray child process.
 type realityRunner struct {
-	bin     string
-	cfgFile string
-	logger  *slog.Logger
+	bin    string
+	logger *slog.Logger
+	host   string
+	port   int
 
 	mu      sync.Mutex
+	cfgFile string // owned by supervise() once running; read under mu elsewhere
 	cmd     *exec.Cmd
 	stopped bool
 
+	reload chan realityReload
 	stop   chan struct{}
 	exited chan struct{}
+}
+
+// realityReload asks the supervisor to swap in a new, already validated config
+// file. The supervisor replies on done; a nil error means xray is running on the
+// new file.
+type realityReload struct {
+	cfgFile string
+	done    chan error
 }
 
 // startReality validates the rendered config before serving, so a broken setup
 // fails loudly at startup instead of leaving a silent dead front door.
 func startReality(cfg Config, k realityKeys, logger *slog.Logger) (*realityRunner, error) {
-	data, err := renderRealityServerConfig(cfg, k)
-	if err != nil {
-		return nil, err
-	}
-
-	file, err := os.CreateTemp("", "xray-reality-*.json")
-	if err != nil {
-		return nil, fmt.Errorf("write xray config: %w", err)
-	}
-	cfgFile := file.Name()
-	if _, err := file.Write(data); err != nil {
-		file.Close()
-		os.Remove(cfgFile)
-		return nil, fmt.Errorf("write xray config: %w", err)
-	}
-	file.Close()
-	// CreateTemp already opens 0600, which matters: the file holds the REALITY
-	// private key and the proxy credentials.
-
 	bin := cfg.RealityXrayBin
 	if bin == "" {
 		bin = "xray"
 	}
-	if _, err := runXray(bin, "run", "-c", cfgFile, "--test"); err != nil {
-		// runXray already carries xray's own complaint, which is the part worth
-		// reading ("failed to listen...", "invalid private key", and so on).
-		os.Remove(cfgFile)
+	cfgFile, err := renderValidatedServerConfig(bin, cfg, k)
+	if err != nil {
 		return nil, err
 	}
 
@@ -617,22 +643,59 @@ func startReality(cfg Config, k realityKeys, logger *slog.Logger) (*realityRunne
 		bin:     bin,
 		cfgFile: cfgFile,
 		logger:  logger,
+		reload:  make(chan realityReload, 1),
 		stop:    make(chan struct{}),
 		exited:  make(chan struct{}),
 	}
+	if host, port, err := splitHostPort(cfg.RealityBind); err == nil {
+		r.host, r.port = host, port
+	}
 	go r.supervise()
 
-	if host, port, err := splitHostPort(cfg.RealityBind); err == nil {
-		r.waitReady(host, port, 10*time.Second)
-	}
+	r.waitReady()
 	return r, nil
+}
+
+// renderValidatedServerConfig writes the config to a private temp file and asks
+// xray to parse it. A config that does not validate is deleted and reported, so
+// a bad change never takes a working front door down.
+func renderValidatedServerConfig(bin string, cfg Config, k realityKeys) (string, error) {
+	data, err := renderRealityServerConfig(cfg, k)
+	if err != nil {
+		return "", err
+	}
+
+	file, err := os.CreateTemp("", "xray-reality-*.json")
+	if err != nil {
+		return "", fmt.Errorf("write xray config: %w", err)
+	}
+	cfgFile := file.Name()
+	if _, err := file.Write(data); err != nil {
+		file.Close()
+		os.Remove(cfgFile)
+		return "", fmt.Errorf("write xray config: %w", err)
+	}
+	file.Close()
+	// CreateTemp already opens 0600, which matters: the file holds the REALITY
+	// private key and the proxy credentials.
+
+	if _, err := runXray(bin, "run", "-c", cfgFile, "--test"); err != nil {
+		// runXray already carries xray's own complaint, which is the part worth
+		// reading ("failed to listen...", "invalid private key", and so on).
+		os.Remove(cfgFile)
+		return "", err
+	}
+	return cfgFile, nil
 }
 
 // waitReady logs whether the REALITY port started answering. A failure here is
 // not fatal: xray may still be retrying, and its own log carries the reason.
-func (r *realityRunner) waitReady(host string, port int, timeout time.Duration) {
-	target := net.JoinHostPort(host, strconv.Itoa(port))
-	deadline := time.Now().Add(timeout)
+func (r *realityRunner) waitReady() {
+	if r.host == "" {
+		return
+	}
+	target := net.JoinHostPort(r.host, strconv.Itoa(r.port))
+	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
 		conn, err := net.DialTimeout("tcp", target, 300*time.Millisecond)
 		if err == nil {
@@ -646,8 +709,18 @@ func (r *realityRunner) waitReady(host string, port int, timeout time.Duration) 
 
 // supervise keeps xray alive. Without this a single crash would silently remove
 // the front door while every dashboard still reported a healthy proxy.
+//
+// It is also the only place the child is started, stopped and re-pointed, which
+// is what makes a config swap safe: the new file is validated by the caller
+// before it is ever offered here, and this goroutine does the stop-then-start
+// with nothing else touching the process.
 func (r *realityRunner) supervise() {
 	defer close(r.exited)
+
+	// A reload waiting for its new child to come up. It is answered once the
+	// child is running, so the dashboard's reply means "xray is serving the new
+	// list", not "xray was asked to".
+	var answered *realityReload
 
 	delay := 5 * time.Second
 	for {
@@ -656,25 +729,60 @@ func (r *realityRunner) supervise() {
 		}
 
 		w := &xrayLogWriter{logger: r.logger}
-		cmd := exec.Command(r.bin, "run", "-c", r.cfgFile)
+		cmd := exec.Command(r.bin, "run", "-c", r.configFile())
 		cmd.Stdout, cmd.Stderr = w, w
 
 		if err := cmd.Start(); err != nil {
 			r.logger.Error("reality: cannot start xray", "error", err)
+			if answered != nil {
+				answered.done <- fmt.Errorf("xray did not start: %w", err)
+				answered = nil
+			}
 		} else {
 			r.setCmd(cmd)
-			waitErr := cmd.Wait()
-			r.setCmd(nil)
-			if r.isStopped() {
+			if answered != nil {
+				r.waitReady()
+				answered.done <- nil
+				answered = nil
+			}
+			// Wait runs in its own goroutine so the loop can still act on a
+			// reload or a stop while the child is running.
+			exited := make(chan error, 1)
+			go func() { exited <- cmd.Wait() }()
+
+			select {
+			case waitErr := <-exited:
+				r.setCmd(nil)
+				if r.isStopped() {
+					return
+				}
+				r.logger.Error("reality: xray exited, restarting", "error", waitErr)
+			case req := <-r.reload:
+				r.logger.Info("reality: reloading client list")
+				r.stopChild(exited)
+				r.swapConfig(req.cfgFile)
+				answered = &req
+				// A deliberate reload is not a crash: start the new child at
+				// once instead of serving the backoff first.
+				continue
+			case <-r.stop:
+				r.setCmd(nil)
+				r.stopChild(exited)
 				return
 			}
-			r.logger.Error("reality: xray exited, restarting", "error", waitErr)
 		}
 
 		select {
 		case <-time.After(delay):
 		case <-r.stop:
 			return
+		case req := <-r.reload:
+			// No child is running here, so the reply waits for the next
+			// successful start. Claiming it is applied now would be a lie the
+			// dashboard would show as "live".
+			r.swapConfig(req.cfgFile)
+			answered = &req
+			continue
 		}
 		if delay < time.Minute {
 			delay *= 2
@@ -683,6 +791,42 @@ func (r *realityRunner) supervise() {
 			}
 		}
 	}
+}
+
+// stopChild ends the running child and waits for the process to actually be
+// gone, so the port is free before its replacement starts.
+func (r *realityRunner) stopChild(exited chan error) {
+	r.mu.Lock()
+	cmd := r.cmd
+	r.mu.Unlock()
+
+	if cmd == nil || cmd.Process == nil {
+		return
+	}
+	_ = cmd.Process.Signal(syscall.SIGTERM)
+	select {
+	case <-exited:
+	case <-time.After(5 * time.Second):
+		_ = cmd.Process.Kill()
+		<-exited
+	}
+}
+
+// swapConfig installs a new config file and deletes the one it replaces.
+func (r *realityRunner) swapConfig(next string) {
+	r.mu.Lock()
+	old := r.cfgFile
+	r.cfgFile = next
+	r.mu.Unlock()
+	if old != "" && old != next {
+		_ = os.Remove(old)
+	}
+}
+
+func (r *realityRunner) configFile() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.cfgFile
 }
 
 func (r *realityRunner) setCmd(cmd *exec.Cmd) {
@@ -695,6 +839,34 @@ func (r *realityRunner) isStopped() bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.stopped
+}
+
+// Reload renders a new config and swaps it in. The config is validated by xray
+// first, so an invalid change is refused and the running front door keeps
+// serving; the previous file is removed only once the new one is accepted.
+func (r *realityRunner) Reload(cfg Config, k realityKeys) error {
+	bin := cfg.RealityXrayBin
+	if bin == "" {
+		bin = r.bin
+	}
+	next, err := renderValidatedServerConfig(bin, cfg, k)
+	if err != nil {
+		return err
+	}
+
+	req := realityReload{cfgFile: next, done: make(chan error, 1)}
+	select {
+	case r.reload <- req:
+	case <-time.After(10 * time.Second):
+		_ = os.Remove(next)
+		return errors.New("xray supervisor is not responding")
+	}
+	select {
+	case err := <-req.done:
+		return err
+	case <-time.After(15 * time.Second):
+		return errors.New("timed out waiting for xray to reload")
+	}
 }
 
 // Stop asks xray to exit, then removes the config holding the private key.
@@ -722,23 +894,23 @@ func (r *realityRunner) Stop() {
 			_ = cmd.Process.Kill()
 		}
 	}
-	_ = os.Remove(r.cfgFile)
+	_ = os.Remove(r.configFile())
 }
 
 // ─── Wiring ─────────────────────────────────────────────────────────────────
 
 // startRealityForServer resolves keys, starts the child and writes the client
 // config operators copy to their own devices.
-func startRealityForServer(cfg Config, persisted map[string]string, store *Store, logger *slog.Logger) (*realityRunner, error) {
+func startRealityForServer(cfg Config, persisted map[string]string, store *Store, logger *slog.Logger) (*realityRunner, realityKeys, error) {
 	if _, err := exec.LookPath(orDefault(cfg.RealityXrayBin, "xray")); err != nil {
 		if _, statErr := os.Stat(orDefault(cfg.RealityXrayBin, "xray")); statErr != nil {
-			return nil, fmt.Errorf("reality_enabled is set but the xray binary is missing: set XRAY_BIN or install it (Docker images ship it at /usr/local/bin/xray)")
+			return nil, realityKeys{}, fmt.Errorf("reality_enabled is set but the xray binary is missing: set XRAY_BIN or install it (Docker images ship it at /usr/local/bin/xray)")
 		}
 	}
 
 	keys, err := resolveRealityKeys(cfg, persisted, store, logger)
 	if err != nil {
-		return nil, err
+		return nil, keys, err
 	}
 
 	if _, port, err := splitHostPort(cfg.RealityBind); err == nil && port == cfg.SinglePort && cfg.SinglePort != 0 {
@@ -747,7 +919,7 @@ func startRealityForServer(cfg Config, persisted map[string]string, store *Store
 
 	runner, err := startReality(cfg, keys, logger)
 	if err != nil {
-		return nil, err
+		return nil, keys, err
 	}
 
 	address := cfg.RealityPublicHost
@@ -777,7 +949,87 @@ func startRealityForServer(cfg Config, persisted map[string]string, store *Store
 		"public_key", keys.PublicKey,
 		"short_id", keys.ShortID,
 		"client_id", strings.Join(keys.ClientIDs, ","))
-	return runner, nil
+	return runner, keys, nil
+}
+
+// ─── Live client-list management ───────────────────────────────────────────
+
+// generateVlessUUID asks xray for an id, which is the same generator that
+// produced the first one. It runs a subprocess because the binary is already a
+// dependency of this feature and rolling our own UUID would be one more thing
+// to get wrong.
+func generateVlessUUID(bin string) (string, error) {
+	out, err := runXray(orDefault(bin, "xray"), "uuid")
+	if err != nil {
+		return "", err
+	}
+	fields := strings.Fields(out)
+	if len(fields) == 0 || !IsUUID(fields[0]) {
+		return "", fmt.Errorf("xray uuid returned %q", strings.TrimSpace(out))
+	}
+	return fields[0], nil
+}
+
+// realityManager returns the runner and keys when the dashboard is allowed to
+// change the client list.
+func (s *ProxyServer) realityManager() (*realityRunner, realityKeys, error) {
+	s.realityMu.Lock()
+	defer s.realityMu.Unlock()
+
+	if s.reality == nil {
+		return nil, realityKeys{}, errors.New("REALITY is not enabled, so there is no xray client list to manage")
+	}
+	// REALITY_CLIENT_IDS pins the list from configuration, which outranks the
+	// database everywhere else in this program. Editing the table would then
+	// look like it worked and change nothing.
+	s.configMu.RLock()
+	pinned := len(s.cfg.RealityClientIDs) > 0
+	s.configMu.RUnlock()
+	if pinned {
+		return nil, realityKeys{}, errors.New("REALITY_CLIENT_IDS is set, which pins the client list; unset it to manage clients here")
+	}
+	return s.reality, s.realityKeys, nil
+}
+
+// requireRealityManager is the handler-side guard for the mutating routes.
+func (s *ProxyServer) requireRealityManager(w http.ResponseWriter) error {
+	if _, _, err := s.realityManager(); err != nil {
+		http.Error(w, err.Error(), http.StatusConflict)
+		return err
+	}
+	return nil
+}
+
+// applyVlessClients re-renders the xray config from the enabled rows and swaps
+// it into the running child. The config is validated before xray is restarted,
+// so a rejected change leaves the front door serving what it was serving.
+func (s *ProxyServer) applyVlessClients() error {
+	runner, keys, err := s.realityManager()
+	if err != nil {
+		return err
+	}
+	s.realityMu.Lock()
+	keys.ClientIDs, err = s.store.EnabledVlessClientUUIDs()
+	s.realityMu.Unlock()
+	if err != nil {
+		return err
+	}
+	if len(keys.ClientIDs) == 0 {
+		return errors.New("this would leave xray with no clients, so the front door would refuse every connection; add one first")
+	}
+
+	s.configMu.RLock()
+	cfg := s.cfg
+	s.configMu.RUnlock()
+
+	if err := runner.Reload(cfg, keys); err != nil {
+		return err
+	}
+	s.realityMu.Lock()
+	s.realityKeys = keys
+	s.realityMu.Unlock()
+	s.logger.Info("reality client list applied", "clients", len(keys.ClientIDs))
+	return nil
 }
 
 func orDefault(v, fallback string) string {

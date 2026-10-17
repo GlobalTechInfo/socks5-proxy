@@ -11,6 +11,7 @@ Deploys on any PaaS, including the ones that expose only a single HTTP endpoint.
 - **Single-Port Multiplexing** - SOCKS5, TLS, dashboards and the tunnel share one port, so it runs on Render/Koyeb/Heroku/Northflank where raw TCP never reaches the app
 - **WebSocket Tunnel** - Carries SOCKS5 over an HTTP upgrade for platforms whose edge terminates TLS; ships with a matching client
 - **REALITY** - Xray front door that presents a real website's certificate to an active prober; sessions still land in the SOCKS5 pipeline
+- **VLESS Client Management** - Add, disable and revoke REALITY UUIDs from the dashboard; xray is reloaded in place, no restart
 - **Client Mode** - Same binary exposes a local SOCKS5 port that relays through the tunnel
 - **User Management** - Create, update, delete users with tier-based limits
 - **Tier System** - Free, Basic, Pro, and Unlimited tiers with connection/data/bandwidth limits
@@ -310,8 +311,14 @@ other REALITY-capable client can import the same parameters instead:
 | Fingerprint | `chrome` |
 | Flow | none |
 
-Give each device its own UUID (`xray uuid`, then list them in
-`REALITY_CLIENT_IDS`) so one can be revoked without disturbing the others.
+Give each device its own UUID so one can be revoked without disturbing the
+others. The dashboard's **REALITY Clients** panel is the usual way: add a client,
+and the UUID reaches xray immediately. Revoking one takes effect within a second
+and needs no restart.
+
+Setting `REALITY_CLIENT_IDS` still works, and pins the list from configuration:
+while it is set the panel says so and refuses changes rather than accepting edits
+that would quietly do nothing.
 
 `REALITY_BIND` defaults to `0.0.0.0:443`, which is IPv4 only. On an IPv6-only
 host set it to `[::]:443`.
@@ -390,7 +397,7 @@ Edit `config.json` or use environment variables (env vars override config file):
 | `REALITY_SERVER_NAMES` | dest host | SNI values to impersonate, comma separated |
 | `REALITY_PRIVATE_KEY` | generated | REALITY private key. Generated once and reused from the database when empty; `xray x25519` prints a pair |
 | `REALITY_SHORT_IDS` | generated | Short ids, comma separated. Up to 16 hex characters; rotating locks out existing clients |
-| `REALITY_CLIENT_IDS` | generated | VLESS UUIDs, comma separated, one per device. `xray uuid` prints one |
+| `REALITY_CLIENT_IDS` | generated | VLESS UUIDs, comma separated. Pins the list and disables panel management |
 | `REALITY_PUBLIC_HOST` | empty | This host's IP or domain, written into the generated client config so it is usable as-is |
 | `XRAY_BIN` | xray | Path to the xray binary |
 | `REALITY_CLIENT_FILE` | reality-client.json | Where the generated client config is written |
@@ -454,8 +461,9 @@ socks5-proxy restore -in socks5-20261017.tar.gz
 
 The archive holds `socks5.db`, `config.json` and, when REALITY is enabled,
 `reality-client.json`. **Restoring the same archive keeps every REALITY client
-working**, because the keypair travels with it; restoring an older or different
-one invalidates every client you have imported.
+working**, because the keypair travels with it and the managed VLESS UUIDs live
+in the database; restoring an older or different one invalidates every client you
+have imported.
 
 `restore` refuses to run while the server is up, because replacing a database
 that another process still has open is how SQLite ends up cleaning up the wrong
