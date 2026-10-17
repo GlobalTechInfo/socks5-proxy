@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -121,6 +122,16 @@ func (s *Store) migrate() error {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_user_connections_user ON user_connections(user_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_user_connections_time ON user_connections(connected_at)`,
+		// VLESS client UUIDs for the REALITY front door. One row per client, so
+		// a revoked id is a deleted or disabled row rather than an edit of a
+		// comma-joined string, and the dashboard has a name to show for each.
+		`CREATE TABLE IF NOT EXISTS vless_clients (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			uuid TEXT UNIQUE NOT NULL,
+			label TEXT NOT NULL DEFAULT '',
+			enabled INTEGER NOT NULL DEFAULT 1,
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+		)`,
 	}
 
 	for _, q := range queries {
@@ -574,6 +585,145 @@ func (s *Store) ResetUserData(id int64) error {
 	defer s.mu.Unlock()
 
 	_, err := s.db.Exec("UPDATE users SET data_used_bytes=0, updated_at=CURRENT_TIMESTAMP WHERE id=?", id)
+	return err
+}
+
+// ─── VLESS clients ─────────────────────────────────────────────────────────
+//
+// The UUIDs xray accepts on the REALITY inbound. Only enabled rows reach the
+// rendered config, so disabling one revokes it without deleting the record.
+
+type VlessClient struct {
+	ID        int64  `json:"id"`
+	UUID      string `json:"uuid"`
+	Label     string `json:"label"`
+	Enabled   bool   `json:"enabled"`
+	CreatedAt string `json:"created_at"`
+}
+
+// IsUUID reports whether s looks like a UUID xray would accept. Deliberately
+// shape-only: this is the trust boundary between an operator typing into the
+// dashboard and the xray config, so the check is cheap and never guesses.
+func IsUUID(s string) bool {
+	if len(s) != 36 {
+		return false
+	}
+	for i, c := range s {
+		switch i {
+		case 8, 13, 18, 23:
+			if c != '-' {
+				return false
+			}
+		default:
+			if !strings.ContainsRune("0123456789abcdefABCDEF", c) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func (s *Store) CreateVlessClient(uuid, label string) (*VlessClient, error) {
+	uuid = strings.TrimSpace(uuid)
+	if !IsUUID(uuid) {
+		return nil, fmt.Errorf("%q is not a UUID", uuid)
+	}
+	s.mu.Lock()
+	res, err := s.db.Exec("INSERT INTO vless_clients (uuid, label) VALUES (?, ?)", uuid, label)
+	if err != nil {
+		s.mu.Unlock()
+		return nil, err
+	}
+	id, err := res.LastInsertId()
+	s.mu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+	// Read the row back rather than echoing the arguments: created_at is a
+	// database default, and a response that shows it empty is worse than one
+	// that shows the truth.
+	return s.GetVlessClient(id)
+}
+
+func (s *Store) ListVlessClients() ([]VlessClient, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	rows, err := s.db.Query("SELECT id, uuid, label, enabled, created_at FROM vless_clients ORDER BY id")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := []VlessClient{}
+	for rows.Next() {
+		var c VlessClient
+		var enabled int
+		if err := rows.Scan(&c.ID, &c.UUID, &c.Label, &enabled, &c.CreatedAt); err != nil {
+			return nil, err
+		}
+		c.Enabled = enabled != 0
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// EnabledVlessClientUUIDs is what the xray config is rendered from.
+func (s *Store) EnabledVlessClientUUIDs() ([]string, error) {
+	clients, err := s.ListVlessClients()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(clients))
+	for _, c := range clients {
+		if c.Enabled {
+			out = append(out, c.UUID)
+		}
+	}
+	return out, nil
+}
+
+func (s *Store) GetVlessClient(id int64) (*VlessClient, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var c VlessClient
+	var enabled int
+	err := s.db.QueryRow("SELECT id, uuid, label, enabled, created_at FROM vless_clients WHERE id=?", id).
+		Scan(&c.ID, &c.UUID, &c.Label, &enabled, &c.CreatedAt)
+	if err != nil {
+		return nil, err
+	}
+	c.Enabled = enabled != 0
+	return &c, nil
+}
+
+func (s *Store) UpdateVlessClient(id int64, label *string, enabled *bool) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if label != nil {
+		if _, err := s.db.Exec("UPDATE vless_clients SET label=? WHERE id=?", *label, id); err != nil {
+			return err
+		}
+	}
+	if enabled != nil {
+		value := 0
+		if *enabled {
+			value = 1
+		}
+		if _, err := s.db.Exec("UPDATE vless_clients SET enabled=? WHERE id=?", value, id); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Store) DeleteVlessClient(id int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	_, err := s.db.Exec("DELETE FROM vless_clients WHERE id=?", id)
 	return err
 }
 

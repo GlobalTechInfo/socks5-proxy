@@ -155,6 +155,7 @@ document.addEventListener('DOMContentLoaded',function(){
   .theme-toggle:hover{color:var(--accent);border-color:var(--accent);box-shadow:0 0 10px var(--shadow)}
   .theme-toggle:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   .actions{display:flex;gap:5px;flex-wrap:wrap}
+  .uuid{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}
   .form-box{background:var(--bg-elevated);border:1px solid var(--border);box-shadow:0 1px 2px var(--shadow);border-radius:12px;padding:20px;position:relative;overflow:hidden}
   .form-box::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;background:linear-gradient(90deg,transparent,var(--accent),transparent)}
   .form-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:15px}
@@ -254,6 +255,46 @@ document.addEventListener('DOMContentLoaded',function(){
     </thead>
     <tbody id="users-body">
       <tr><td colspan="8" style="color:#555">Loading...</td></tr>
+    </tbody>
+  </table>
+  </div>
+</div>
+
+<div class="section">
+  <h2>REALITY Clients (VLESS UUIDs)</h2>
+  <div class="form-box">
+    <div id="vless-msg" class="msg"></div>
+    <p style="color:#6b7280;font-size:13px;margin:0 0 12px">
+      Each UUID is one client allowed through the REALITY front door. Changes are
+      applied to xray immediately: a deleted or disabled UUID stops working
+      within a second, with no restart.
+    </p>
+    <div class="form-grid">
+      <div class="field">
+        <label for="v-label">Label (who is this for?)</label>
+        <input type="text" id="v-label" placeholder="e.g. alice's phone">
+      </div>
+      <div class="field">
+        <label for="v-uuid">UUID (generated if empty)</label>
+        <input type="text" id="v-uuid" placeholder="auto-generated if empty">
+      </div>
+    </div>
+    <button class="btn btn-primary" onclick="createVlessClient()">Add Client</button>
+  </div>
+
+  <div class="table-wrap">
+    <table style="margin-top:16px">
+    <thead>
+      <tr>
+        <th>ID</th>
+        <th>Label</th>
+        <th>UUID</th>
+        <th>Status</th>
+        <th>Actions</th>
+      </tr>
+    </thead>
+    <tbody id="vless-body">
+      <tr><td colspan="5" style="color:#555">Loading...</td></tr>
     </tbody>
   </table>
   </div>
@@ -537,10 +578,113 @@ async function saveConfig(){
   }catch(e){msg.textContent='Network error: '+e.message;msg.className='msg msg-err';msg.style.display='block'}
 }
 
+function el(tag,text){var e=document.createElement(tag);if(text!==undefined)e.textContent=text;return e}
+
+async function loadVlessClients(){
+  var msg=document.getElementById('vless-msg');
+  var tbody=document.getElementById('vless-body');
+  try{
+    var r=await fetch('/api/vless-clients',{credentials:'same-origin'});
+    var data=await r.json();
+    if(!data.reality_enabled){
+      tbody.innerHTML='';
+      var row=el('tr'),cell=el('td','');
+      cell.colSpan=5;
+      cell.style.color='#555';
+      cell.textContent='REALITY is not enabled, so there is no client list to manage.';
+      row.appendChild(cell);tbody.appendChild(row);
+      document.querySelector('#v-label').disabled=true;
+      document.querySelector('#v-uuid').disabled=true;
+      return;
+    }
+    if(data.managed_by_config){
+      msg.textContent='REALITY_CLIENT_IDS is set, which pins the list. Unset it to manage clients here.';
+      msg.className='msg msg-err';msg.style.display='block';
+    }
+    tbody.innerHTML='';
+    if(!data.clients||data.clients.length===0){
+      var empty=el('tr'),ecell=el('td','No clients. Add one above.');
+      ecell.colSpan=5;ecell.style.color='#555';
+      empty.appendChild(ecell);tbody.appendChild(empty);
+      return;
+    }
+    for(var i=0;i<data.clients.length;i++){
+      var c=data.clients[i];
+      var row=el('tr');
+      row.appendChild(el('td',String(c.id)));
+      row.appendChild(el('td',c.label||''));
+      var uuidCell=el('td'),mono=el('span',c.uuid);
+      mono.className='uuid';
+      uuidCell.appendChild(mono);
+      var copy=el('button','Copy');
+      copy.className='btn btn-sm';
+      copy.style.marginLeft='8px';
+      copy.onclick=function(){navigator.clipboard.writeText(c.uuid)};
+      uuidCell.appendChild(copy);
+      row.appendChild(uuidCell);
+      var status=el('td');
+      var badge=el('span',c.enabled?'active':'disabled');
+      badge.className='badge '+(c.enabled?'badge-active':'badge-disabled');
+      status.appendChild(badge);
+      row.appendChild(status);
+      var actions=el('td');
+      actions.className='actions';
+      var toggle=el('button',c.enabled?'Disable':'Enable');
+      toggle.className='btn btn-sm '+(c.enabled?'btn-danger':'btn-success');
+      toggle.onclick=function(){toggleVlessClient(c.id,!c.enabled)};
+      var del=el('button','Del');
+      del.className='btn btn-sm btn-danger';
+      del.onclick=function(){deleteVlessClient(c.id,c.label||c.uuid)};
+      actions.appendChild(toggle);actions.appendChild(del);
+      row.appendChild(actions);
+      tbody.appendChild(row);
+    }
+  }catch(e){
+    msg.textContent='Could not load clients: '+e.message;
+    msg.className='msg msg-err';msg.style.display='block';
+  }
+}
+
+async function createVlessClient(){
+  var msg=document.getElementById('vless-msg');
+  var body={label:document.getElementById('v-label').value,uuid:document.getElementById('v-uuid').value.trim()};
+  try{
+    var r=await fetch('/api/vless-clients',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    if(r.ok){
+      var data=await r.json();
+      msg.textContent='Client added: '+data.uuid;
+      msg.className='msg msg-ok';msg.style.display='block';
+      document.getElementById('v-label').value='';document.getElementById('v-uuid').value='';
+      loadVlessClients();
+    }else{
+      msg.textContent='Error: '+(await r.text());
+      msg.className='msg msg-err';msg.style.display='block';
+    }
+  }catch(e){msg.textContent='Network error: '+e.message;msg.className='msg msg-err';msg.style.display='block'}
+}
+
+async function toggleVlessClient(id,enabled){
+  var msg=document.getElementById('vless-msg');
+  var r=await fetch('/api/vless-clients/'+id,{method:'PUT',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:enabled})});
+  if(!r.ok){msg.textContent='Error: '+(await r.text());msg.className='msg msg-err';msg.style.display='block'}
+  else{msg.style.display='none'}
+  loadVlessClients();
+}
+
+async function deleteVlessClient(id,label){
+  if(!confirm('Delete client "'+label+'"? It stops working immediately.'))return;
+  var msg=document.getElementById('vless-msg');
+  var r=await fetch('/api/vless-clients/'+id,{method:'DELETE',credentials:'same-origin'});
+  if(!r.ok){msg.textContent='Error: '+(await r.text());msg.className='msg msg-err';msg.style.display='block'}
+  else{msg.style.display='none'}
+  loadVlessClients();
+}
+
 renderTimeline();
 poll();
 pollHistory();
 loadUsers();
+loadVlessClients();
 loadConfig();
 setInterval(poll,2000);
 setInterval(pollHistory,10000);

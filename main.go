@@ -538,6 +538,14 @@ type ProxyServer struct {
 	// Persistence
 	store *Store
 
+	// REALITY front door. The runner is nil unless REALITY_ENABLED is set, and
+	// realityKeys is the key material its config was rendered from, so a
+	// dashboard change to the VLESS client list can be re-rendered and swapped
+	// in without a restart.
+	realityMu   sync.Mutex
+	reality     *realityRunner
+	realityKeys realityKeys
+
 	// Shutdown
 	shutdownOnce sync.Once
 	shutdownCh   chan struct{}
@@ -1736,6 +1744,150 @@ func (s *ProxyServer) adminHandler() http.Handler {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	})
 
+	// ─── VLESS clients (REALITY) ──────────────────────────────────────────
+	//
+	// A UUID added here is accepted by xray within a second, and a deleted or
+	// disabled one stops working just as fast. Management that only took
+	// effect on restart would be a trap.
+
+	mux.HandleFunc("/api/vless-clients", func(w http.ResponseWriter, r *http.Request) {
+		if s.store == nil {
+			http.Error(w, "database not available", http.StatusServiceUnavailable)
+			return
+		}
+
+		switch r.Method {
+		case http.MethodGet:
+			clients, err := s.store.ListVlessClients()
+			if err != nil {
+				http.Error(w, "list failed: "+err.Error(), http.StatusInternalServerError)
+				return
+			}
+			s.realityMu.Lock()
+			enabled := s.reality != nil
+			s.realityMu.Unlock()
+			s.configMu.RLock()
+			pinned := len(s.cfg.RealityClientIDs) > 0
+			s.configMu.RUnlock()
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]any{
+				"clients":           clients,
+				"reality_enabled":   enabled,
+				"managed_by_config": pinned,
+			})
+
+		case http.MethodPost:
+			if err := s.requireRealityManager(w); err != nil {
+				return
+			}
+			var req struct {
+				UUID  string `json:"uuid"`
+				Label string `json:"label"`
+			}
+			if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req); err != nil {
+				http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
+				return
+			}
+			s.configMu.RLock()
+			xrayBin := s.cfg.RealityXrayBin
+			s.configMu.RUnlock()
+
+			uuid := strings.TrimSpace(req.UUID)
+			if uuid == "" {
+				generated, err := generateVlessUUID(xrayBin)
+				if err != nil {
+					http.Error(w, "could not generate a uuid: "+err.Error(), http.StatusInternalServerError)
+					return
+				}
+				uuid = generated
+			}
+			client, err := s.store.CreateVlessClient(uuid, req.Label)
+			if err != nil {
+				http.Error(w, "create failed: "+err.Error(), http.StatusBadRequest)
+				return
+			}
+			if err := s.applyVlessClients(); err != nil {
+				// The row is saved, so removing it here keeps the database and
+				// the running xray telling the same story.
+				s.store.DeleteVlessClient(client.ID)
+				http.Error(w, "xray rejected the change, nothing was applied: "+err.Error(), http.StatusInternalServerError)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusCreated)
+			json.NewEncoder(w).Encode(client)
+
+		default:
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		}
+	})
+
+	mux.HandleFunc("/api/vless-clients/", func(w http.ResponseWriter, r *http.Request) {
+		if s.store == nil {
+			http.Error(w, "database not available", http.StatusServiceUnavailable)
+			return
+		}
+		parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/api/vless-clients/"), "/")
+		if len(parts) == 0 || parts[0] == "" {
+			http.Error(w, "client ID required", http.StatusBadRequest)
+			return
+		}
+		id := parseInt64(parts[0])
+
+		switch {
+		case r.Method == http.MethodDelete && len(parts) == 1:
+			if err := s.requireRealityManager(w); err != nil {
+				return
+			}
+			client, err := s.store.GetVlessClient(id)
+			if err != nil {
+				http.Error(w, "client not found", http.StatusNotFound)
+				return
+			}
+			if err := s.store.DeleteVlessClient(id); err != nil {
+				http.Error(w, "delete failed: "+err.Error(), http.StatusInternalServerError)
+				return
+			}
+			if err := s.applyVlessClients(); err != nil {
+				// Put the row back: xray never stopped accepting it, so the
+				// database must not claim otherwise.
+				if _, rerr := s.store.CreateVlessClient(client.UUID, client.Label); rerr != nil {
+					s.logger.Error("could not restore a refused vless client", "uuid", client.UUID, "error", rerr)
+				}
+				http.Error(w, "xray rejected the change, nothing was applied: "+err.Error(), http.StatusInternalServerError)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]string{"status": "deleted"})
+
+		case r.Method == http.MethodPut && len(parts) == 1:
+			if err := s.requireRealityManager(w); err != nil {
+				return
+			}
+			var req struct {
+				Label   *string `json:"label"`
+				Enabled *bool   `json:"enabled"`
+			}
+			if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req); err != nil {
+				http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
+				return
+			}
+			if err := s.store.UpdateVlessClient(id, req.Label, req.Enabled); err != nil {
+				http.Error(w, "update failed: "+err.Error(), http.StatusInternalServerError)
+				return
+			}
+			if err := s.applyVlessClients(); err != nil {
+				http.Error(w, "xray rejected the change, nothing was applied: "+err.Error(), http.StatusInternalServerError)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]string{"status": "updated"})
+
+		default:
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		}
+	})
+
 	// GET /api/tiers - list available tiers
 	mux.HandleFunc("/api/tiers", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
@@ -2079,12 +2231,15 @@ func runServer(logger *slog.Logger, configFile string) {
 	// rather than leaving a front door that never came up.
 	var reality *realityRunner
 	if cfg.RealityEnabled {
-		runner, err := startRealityForServer(cfg, dbCfg, store, logger)
+		runner, keys, err := startRealityForServer(cfg, dbCfg, store, logger)
 		if err != nil {
 			logger.Error("failed to start REALITY", "error", err)
 			os.Exit(1)
 		}
 		reality = runner
+		// Handed to the server so the dashboard can add and revoke VLESS
+		// clients without a restart.
+		server.reality, server.realityKeys = runner, keys
 	}
 
 	// Periodic stats persistence (every 60 seconds)
