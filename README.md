@@ -490,6 +490,9 @@ The archive holds `socks5.db`, `config.json` and, when REALITY is enabled,
 working**, because the keypair travels with it and the managed VLESS UUIDs and
 MTProto secrets live in the database; restoring an older or different one
 invalidates every client you have imported.
+working**, because the keypair travels with it and the managed VLESS UUIDs live
+in the database; restoring an older or different one invalidates every client you
+have imported.
 
 `restore` refuses to run while the server is up, because replacing a database
 that another process still has open is how SQLite ends up cleaning up the wrong
