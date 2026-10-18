@@ -586,6 +586,12 @@ go test -run TestRealityEndToEnd -v ./...   # needs xray on PATH
   key when it is enabled. The key is the reason to use `-passphrase` for
   anything that leaves the machine; keep the passphrase somewhere other than the
   backup directory.
+- The admin API refuses state-changing requests that another site could have
+  caused. It authenticates with HTTP Basic, and browsers attach those credentials
+  to any request for the origin no matter which page started it, so without this
+  a form on any website could delete a user or revoke a REALITY UUID. Requests
+  arriving with a foreign `Origin` or `Sec-Fetch-Site: cross-site` are refused;
+  requests with no `Origin` are left alone, so `curl` and scripts keep working.
 - `/health` is the only endpoint reachable without admin credentials, and it
   returns `{"status":"ok"}` with no uptime or version: on a public port it is
   the one thing a scanner can read, so it says nothing. `/metrics`,
