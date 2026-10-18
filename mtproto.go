@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
@@ -15,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -348,14 +350,79 @@ func mtprotoDCAddress(dc int, overrides map[int]string) string {
 // their hex form so the dashboard and the database speak the same identifier.
 type mtprotoSecrets map[string][]byte
 
+// mtprotoGrant is one secret together with the plan it is held to. The Telegram
+// relay does not pass through the SOCKS5 pipeline, so without this a phone on a
+// free plan would get the same unlimited pipe as one paying for pro.
+type mtprotoGrant struct {
+	// name is the secret as stored, which is how usage is keyed and how the
+	// dashboard refers to it.
+	name string
+	key  []byte
+	tier Tier
+}
+
+// mtprotoGrants is the live set, keyed the same way as mtprotoSecrets.
+type mtprotoGrants map[string]mtprotoGrant
+
+// mtprotoUsage is what a secret has used and is using right now.
+type mtprotoUsage struct {
+	active    atomic.Int64
+	bytesUp   atomic.Int64
+	bytesDown atomic.Int64
+}
+
+// mtprotoSnapshot is one secret's standing, for the API and the dashboard.
+type mtprotoSnapshot struct {
+	Secret    string `json:"secret"`
+	Active    int64  `json:"active_connections"`
+	BytesUp   int64  `json:"bytes_up"`
+	BytesDown int64  `json:"bytes_down"`
+}
+
+// mtprotoUsageFor returns the counters for a secret, creating them on first use.
+func (m *mtprotoServer) usageFor(secret string) *mtprotoUsage {
+	m.usageMu.Lock()
+	defer m.usageMu.Unlock()
+	if m.usage == nil {
+		m.usage = map[string]*mtprotoUsage{}
+	}
+	u, ok := m.usage[secret]
+	if !ok {
+		u = &mtprotoUsage{}
+		m.usage[secret] = u
+	}
+	return u
+}
+
+// mtprotoUsageSnapshot reports every secret that has been used, so a dashboard
+// polling once a second does not allocate.
+func (m *mtprotoServer) mtprotoUsageSnapshot() []mtprotoSnapshot {
+	m.usageMu.Lock()
+	defer m.usageMu.Unlock()
+	out := make([]mtprotoSnapshot, 0, len(m.usage))
+	for secret, u := range m.usage {
+		out = append(out, mtprotoSnapshot{
+			Secret:    secret,
+			Active:    u.active.Load(),
+			BytesUp:   u.bytesUp.Load(),
+			BytesDown: u.bytesDown.Load(),
+		})
+	}
+	return out
+}
+
 // mtprotoServer accepts Telegram clients and relays them to a datacenter.
 type mtprotoServer struct {
 	cfg Config
 	// secrets is a getter, not a map: the set is replaced when the dashboard
 	// changes it, and a copy taken at startup would keep serving secrets that
 	// have since been revoked.
-	secrets   func() mtprotoSecrets
+	secrets   func() mtprotoGrants
 	overrides map[int]string
+	// usage tracks, per secret, what a plan is measured against.
+	usageMu sync.Mutex
+	usage   map[string]*mtprotoUsage
+
 	// cloakHost is the domain the fake TLS reply is built around when a client
 	// does not name one of its own.
 	cloakHost string
@@ -401,10 +468,31 @@ func (m *mtprotoServer) handle(conn net.Conn) {
 		dialTimeout = 10 * time.Second
 	}
 
-	session, dc, err := m.accept(conn)
+	session, dc, grant, err := m.accept(conn)
 	if err != nil {
 		log.Debug("mtproto handshake refused", "error", err)
 		return
+	}
+
+	// The plan is enforced here rather than left to the SOCKS5 pipeline, which
+	// this relay does not pass through: without it every phone gets the same
+	// unlimited pipe regardless of what it is on the books for.
+	usage := m.usageFor(grant.name)
+	if over, limit := mtprotoOverDataCap(usage, grant.tier); over {
+		log.Warn("refused: data cap reached", "tier", grant.tier.Name, "limit", limit)
+		return
+	}
+	if max := grant.tier.MaxConnections; max > 0 && usage.active.Load() >= int64(max) {
+		log.Warn("refused: too many sessions", "tier", grant.tier.Name, "active", usage.active.Load(), "limit", max)
+		return
+	}
+	usage.active.Add(1)
+	defer usage.active.Add(-1)
+
+	var upPacer, downPacer *pacer
+	if mbps := grant.tier.BandwidthMbps; mbps > 0 {
+		upPacer = newPacer(mbps)
+		downPacer = newPacer(mbps)
 	}
 
 	upstream, err := mtprotoDial(dc, dialTimeout, m.overrides)
@@ -425,14 +513,15 @@ func (m *mtprotoServer) handle(conn net.Conn) {
 	// first side to go takes the other with it.
 	go func() {
 		defer closeBoth()
-		copyStream(upstream, session, log)
+		copyStreamCounted(upstream, session, log, upPacer, &usage.bytesUp)
 	}()
 	go func() {
 		defer closeBoth()
-		copyStream(session, upstream, log)
+		copyStreamCounted(session, upstream, log, downPacer, &usage.bytesDown)
 	}()
 
-	log.Info("mtproto session relayed", "dc", dc, "address", mtprotoDCAddress(dc, m.overrides))
+	log.Info("mtproto session relayed", "dc", dc, "address", mtprotoDCAddress(dc, m.overrides),
+		"tier", grant.tier.Name)
 	<-time.After(idle)
 	closeBoth()
 }
@@ -440,12 +529,12 @@ func (m *mtprotoServer) handle(conn net.Conn) {
 // accept reads the client's opening and works out which transport it speaks.
 // A TLS handshake starts 0x16; anything else is obfuscated2. The choice comes
 // from the first byte, which is what lets one port serve both.
-func (m *mtprotoServer) accept(conn net.Conn) (*mtprotoSession, int, error) {
+func (m *mtprotoServer) accept(conn net.Conn) (*mtprotoSession, int, mtprotoGrant, error) {
 	secrets := m.secrets()
 
 	peek := make([]byte, 1)
 	if _, err := io.ReadFull(conn, peek); err != nil {
-		return nil, 0, err
+		return nil, 0, mtprotoGrant{}, err
 	}
 
 	// The peeked byte is the first byte of whichever handshake follows, so it is
@@ -457,11 +546,14 @@ func (m *mtprotoServer) accept(conn net.Conn) (*mtprotoSession, int, error) {
 		// anything else is read.
 		wrapped, hello, err := fakeTLSHandshake(conn, secrets, time.Now(), m.cloakHost)
 		if err != nil {
-			return nil, 0, err
+			return nil, 0, mtprotoGrant{}, err
 		}
 		m.log.Info("fake tls hello accepted", "domain", hello.Domain)
 		session, dc, err := m.acceptWithSecret(wrapped, hello.Secret)
-		return session, dc, err
+		if err != nil {
+			return nil, 0, mtprotoGrant{}, err
+		}
+		return session, dc, m.grantForSecret(secrets, hello.Secret), nil
 	}
 
 	return m.acceptWithAnySecret(conn, secrets)
@@ -490,18 +582,18 @@ func (m *mtprotoServer) acceptWithSecret(conn mtprotoConn, secret []byte) (*mtpr
 // from the same connection, so a wrong secret only costs the client opening
 // bytes: the server has consumed exactly the same 64 bytes either way, and the
 // stream is discarded between attempts.
-func (m *mtprotoServer) acceptWithAnySecret(conn mtprotoConn, secrets mtprotoSecrets) (*mtprotoSession, int, error) {
+func (m *mtprotoServer) acceptWithAnySecret(conn mtprotoConn, secrets mtprotoGrants) (*mtprotoSession, int, mtprotoGrant, error) {
 	if len(secrets) == 0 {
-		return nil, 0, errors.New("no MTProto secret is configured")
+		return nil, 0, mtprotoGrant{}, errors.New("no MTProto secret is configured")
 	}
 	init := make([]byte, mtprotoInitLen)
 	if _, err := io.ReadFull(conn, init); err != nil {
-		return nil, 0, err
+		return nil, 0, mtprotoGrant{}, err
 	}
 
 	var lastErr error
-	for _, secret := range secrets {
-		toPeer, fromPeer, err := mtprotoStreams(init, secret)
+	for _, grant := range secrets {
+		toPeer, fromPeer, err := mtprotoStreams(init, grant.key)
 		if err != nil {
 			lastErr = err
 			continue
@@ -522,21 +614,62 @@ func (m *mtprotoServer) acceptWithAnySecret(conn mtprotoConn, secrets mtprotoSec
 			continue
 		}
 		dc := int(binary.LittleEndian.Uint16(probe[60:62]))
-		return &mtprotoSession{conn: conn, toPeer: toPeer, from: fromPeer}, dc, nil
+		return &mtprotoSession{conn: conn, toPeer: toPeer, from: fromPeer}, dc, grant, nil
 	}
 	if lastErr == nil {
 		lastErr = errors.New("no configured secret matched")
 	}
-	return nil, 0, lastErr
+	return nil, 0, mtprotoGrant{}, lastErr
+}
+
+// grantForSecret finds the plan a fake TLS client belongs to. The hello proved
+// which key it holds, so this is a lookup rather than another guess.
+func (m *mtprotoServer) grantForSecret(secrets mtprotoGrants, key []byte) mtprotoGrant {
+	for _, grant := range secrets {
+		if hmac.Equal(grant.key, key) {
+			return grant
+		}
+	}
+	return mtprotoGrant{}
 }
 
 // copyStream moves bytes until one side stops or the idle window closes.
 func copyStream(dst io.Writer, src io.Reader, log *slog.Logger) {
-	// io.Copy rather than a hand-rolled loop: it deals with short writes, which
-	// a relay that drops them turns into silent truncation.
-	if _, err := io.CopyBuffer(dst, src, make([]byte, 32*1024)); err != nil {
-		log.Debug("mtproto relay ended", "error", err)
+	copyStreamCounted(dst, src, log, nil, nil)
+}
+
+// copyStreamCounted is copyStream with the plan applied: the pacer holds the
+// tier's bandwidth, and every byte is added to what the secret has used.
+//
+// io.CopyBuffer rather than a hand-rolled loop, because it deals with short
+// writes -- and a relay that drops them truncates messages silently. The reader
+// side counts bytes as it arrives, which is what the plan is billed on.
+func copyStreamCounted(dst io.Writer, src io.Reader, log *slog.Logger, p *pacer, counter *atomic.Int64) {
+	buf := make([]byte, 32*1024)
+	for {
+		n, err := src.Read(buf)
+		if n > 0 {
+			if counter != nil {
+				counter.Add(int64(n))
+			}
+			p.reserve(n)
+			if _, werr := dst.Write(buf[:n]); werr != nil {
+				return
+			}
+		}
+		if err != nil {
+			return
+		}
 	}
+}
+
+// mtprotoOverDataCap reports whether a secret has used its allowance.
+func mtprotoOverDataCap(usage *mtprotoUsage, tier Tier) (bool, int64) {
+	if tier.DataLimitBytes <= 0 {
+		return false, 0
+	}
+	used := usage.bytesUp.Load() + usage.bytesDown.Load()
+	return used >= tier.DataLimitBytes, tier.DataLimitBytes
 }
 
 // ─── Secrets ────────────────────────────────────────────────────────────────
@@ -601,8 +734,8 @@ func parseMTProtoSecret(stored string) ([]byte, error) {
 // database, so a fresh install gets one generated and can start serving
 // immediately rather than refusing to start and waiting to be configured.
 func (s *ProxyServer) startMTProto(secrets mtprotoSecrets) error {
-	secrets = s.loadMTProtoSecrets(secrets, true)
-	if len(secrets) == 0 {
+	grants := s.loadMTProtoSecrets(secrets, true)
+	if len(grants) == 0 {
 		return errors.New("no MTProto secret is configured; add one in the dashboard")
 	}
 
@@ -610,11 +743,6 @@ func (s *ProxyServer) startMTProto(secrets mtprotoSecrets) error {
 	if err != nil {
 		return fmt.Errorf("listen on %s: %w", s.cfg.MTProtoBind, err)
 	}
-
-	s.mtprotoMu.Lock()
-	s.mtprotoSecrets = secrets
-	s.mtprotoListener = listener
-	s.mtprotoMu.Unlock()
 
 	server := &mtprotoServer{
 		cfg:       s.cfg,
@@ -625,10 +753,17 @@ func (s *ProxyServer) startMTProto(secrets mtprotoSecrets) error {
 		track:     s.trackConn,
 		untrack:   s.untrackConn,
 		listener:  listener,
+		usage:     map[string]*mtprotoUsage{},
 	}
+	s.mtprotoMu.Lock()
+	s.mtprotoSecrets = grants
+	s.mtprotoListener = listener
+	s.mtprotoServer = server
+	s.mtprotoMu.Unlock()
+
 	go server.serve()
 
-	s.logger.Info("MTProto enabled", "bind", s.cfg.MTProtoBind, "secrets", len(secrets),
+	s.logger.Info("MTProto enabled", "bind", s.cfg.MTProtoBind, "secrets", len(grants),
 		"edit", "in the dashboard, or Telegram: Settings -> Data and Storage -> Proxy")
 	return nil
 }
@@ -639,8 +774,8 @@ func (s *ProxyServer) startMTProto(secrets mtprotoSecrets) error {
 // be false: revoking the last secret has to leave the proxy refusing everyone,
 // because quietly minting a replacement would undo the operator's decision and
 // hand out a working credential they never asked for.
-func (s *ProxyServer) loadMTProtoSecrets(fallback mtprotoSecrets, generateIfEmpty bool) mtprotoSecrets {
-	out := mtprotoSecrets{}
+func (s *ProxyServer) loadMTProtoSecrets(fallback mtprotoSecrets, generateIfEmpty bool) mtprotoGrants {
+	out := mtprotoGrants{}
 	if s.store != nil {
 		if stored, err := s.store.ListMtprotoSecrets(); err != nil {
 			s.logger.Warn("could not read MTProto secrets", "error", err)
@@ -650,22 +785,29 @@ func (s *ProxyServer) loadMTProtoSecrets(fallback mtprotoSecrets, generateIfEmpt
 					continue
 				}
 				if key, err := parseMTProtoSecret(sec.Secret); err == nil {
-					out[sec.Secret] = key
+					tier := Tiers[sec.Tier]
+					if tier.Name == "" {
+						tier = Tiers[defaultMtprotoTier]
+					}
+					out[sec.Secret] = mtprotoGrant{name: sec.Secret, key: key, tier: tier}
 				}
 			}
 		}
 	}
 	if len(out) == 0 {
+		// Nothing stored: fall back to whatever was configured, held to the
+		// default plan rather than being quietly throttled.
+		tier := Tiers[defaultMtprotoTier]
 		for name, key := range fallback {
-			out[name] = key
+			out[name] = mtprotoGrant{name: name, key: key, tier: tier}
 		}
 	}
 	if len(out) == 0 && generateIfEmpty && s.store != nil {
 		secret, err := generateMTProtoSecret(s.cfg.MTProtoSecretKind)
 		if err == nil {
-			if _, err := s.store.CreateMtprotoSecret(secret, "generated"); err == nil {
+			if _, err := s.store.CreateMtprotoSecret(secret, "generated", defaultMtprotoTier); err == nil {
 				if key, kerr := parseMTProtoSecret(secret); kerr == nil {
-					out[secret] = key
+					out[secret] = mtprotoGrant{name: secret, key: key, tier: Tiers[defaultMtprotoTier]}
 				}
 				s.logger.Info("generated the first MTProto secret", "secret", secret)
 			}
@@ -676,14 +818,14 @@ func (s *ProxyServer) loadMTProtoSecrets(fallback mtprotoSecrets, generateIfEmpt
 
 // setMTProtoSecrets replaces the live set after a dashboard change. Nothing has
 // to be restarted: the set is consulted on every connection.
-func (s *ProxyServer) setMTProtoSecrets(secrets mtprotoSecrets) {
+func (s *ProxyServer) setMTProtoSecrets(secrets mtprotoGrants) {
 	s.mtprotoMu.Lock()
 	s.mtprotoSecrets = secrets
 	s.mtprotoMu.Unlock()
 }
 
 // mtprotoLiveSecrets is the set currently being served.
-func (s *ProxyServer) mtprotoLiveSecrets() mtprotoSecrets {
+func (s *ProxyServer) mtprotoLiveSecrets() mtprotoGrants {
 	s.mtprotoMu.RLock()
 	defer s.mtprotoMu.RUnlock()
 	return s.mtprotoSecrets

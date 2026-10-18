@@ -582,8 +582,9 @@ type ProxyServer struct {
 	// on every connection; the database holds them so the dashboard can manage
 	// them across restarts.
 	mtprotoMu       sync.RWMutex
-	mtprotoSecrets  mtprotoSecrets
+	mtprotoSecrets  mtprotoGrants
 	mtprotoListener net.Listener
+	mtprotoServer   *mtprotoServer
 
 	// Shutdown
 	shutdownOnce sync.Once
@@ -2003,16 +2004,29 @@ func (s *ProxyServer) adminHandler() http.Handler {
 			s.mtprotoMu.RLock()
 			live := len(s.mtprotoSecrets)
 			bind := ""
+			var server *mtprotoServer
 			if s.mtprotoListener != nil {
 				bind = s.mtprotoListener.Addr().String()
+				server = s.mtprotoServer
 			}
 			s.mtprotoMu.RUnlock()
+
+			// What each phone has used, so a plan can be seen doing something
+			// rather than only being configured.
+			usage := map[string]mtprotoSnapshot{}
+			if server != nil {
+				for _, snap := range server.mtprotoUsageSnapshot() {
+					usage[snap.Secret] = snap
+				}
+			}
+
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(map[string]any{
 				"secrets":         secrets,
 				"mtproto_enabled": enabled,
 				"bind":            bind,
 				"live_secrets":    live,
+				"usage":           usage,
 			})
 
 		case http.MethodPost:
@@ -2028,6 +2042,8 @@ func (s *ProxyServer) adminHandler() http.Handler {
 				// The kind is per secret rather than only a server-wide default,
 				// so both kinds can be handed out from the same running service.
 				Kind string `json:"kind"`
+				// The plan this phone is held to, same tiers as the SOCKS5 port.
+				Tier string `json:"tier"`
 			}
 			if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req); err != nil {
 				http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
@@ -2044,7 +2060,11 @@ func (s *ProxyServer) adminHandler() http.Handler {
 				http.Error(w, "could not generate a secret: "+err.Error(), http.StatusInternalServerError)
 				return
 			}
-			created, err := s.store.CreateMtprotoSecret(secret, req.Label)
+			tier := defaultMtprotoTier
+			if req.Tier != "" {
+				tier = req.Tier
+			}
+			created, err := s.store.CreateMtprotoSecret(secret, req.Label, tier)
 			if err != nil {
 				http.Error(w, "create failed: "+err.Error(), http.StatusInternalServerError)
 				return
@@ -2084,13 +2104,14 @@ func (s *ProxyServer) adminHandler() http.Handler {
 		case r.Method == http.MethodPut && len(parts) == 1:
 			var req struct {
 				Label   *string `json:"label"`
+				Tier    *string `json:"tier"`
 				Enabled *bool   `json:"enabled"`
 			}
 			if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req); err != nil {
 				http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
 				return
 			}
-			if err := s.store.UpdateMtprotoSecret(id, req.Label, req.Enabled); err != nil {
+			if err := s.store.UpdateMtprotoSecret(id, req.Label, req.Tier, req.Enabled); err != nil {
 				http.Error(w, "update failed: "+err.Error(), http.StatusInternalServerError)
 				return
 			}

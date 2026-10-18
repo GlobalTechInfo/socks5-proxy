@@ -283,6 +283,15 @@ document.addEventListener('DOMContentLoaded',function(){
           <option value="dd">dd &mdash; obfuscated2 (plain)</option>
         </select>
       </div>
+      <div class="field">
+        <label for="m-tier">Tier</label>
+        <select id="m-tier">
+          <option value="unlimited">Unlimited</option>
+          <option value="pro">Pro (20 sessions / 50Mbps)</option>
+          <option value="basic">Basic (5 sessions / 5Mbps / 50GB)</option>
+          <option value="free">Free (1 session / 1Mbps / 1GB)</option>
+        </select>
+      </div>
     </div>
     <button class="btn btn-primary" onclick="createMtprotoSecret()">Add Secret</button>
   </div>
@@ -294,12 +303,14 @@ document.addEventListener('DOMContentLoaded',function(){
         <th>ID</th>
         <th>Label</th>
         <th>Secret</th>
+        <th>Tier</th>
+        <th>Used</th>
         <th>Status</th>
         <th>Actions</th>
       </tr>
     </thead>
     <tbody id="mtproto-body">
-      <tr><td colspan="5" style="color:#555">Loading...</td></tr>
+      <tr><td colspan="6" style="color:#555">Loading...</td></tr>
     </tbody>
   </table>
   </div>
@@ -339,7 +350,7 @@ document.addEventListener('DOMContentLoaded',function(){
       </tr>
     </thead>
     <tbody id="vless-body">
-      <tr><td colspan="5" style="color:#555">Loading...</td></tr>
+      <tr><td colspan="6" style="color:#555">Loading...</td></tr>
     </tbody>
   </table>
   </div>
@@ -641,7 +652,7 @@ async function loadMtprotoSecrets(){
     tbody.innerHTML='';
     if(!data.secrets||data.secrets.length===0){
       var empty=el('tr'),ecell=el('td','No secrets yet. Add one above.');
-      ecell.colSpan=5;ecell.style.color='#555';
+      ecell.colSpan=6;ecell.style.color='#555';
       empty.appendChild(ecell);tbody.appendChild(empty);
       return;
     }
@@ -659,6 +670,9 @@ async function loadMtprotoSecrets(){
       copy.onclick=function(){navigator.clipboard.writeText(c.secret)};
       secretCell.appendChild(copy);
       row.appendChild(secretCell);
+      row.appendChild(el('td',c.tier||'unlimited'));
+      var used=data.usage&&data.usage[c.secret];
+      row.appendChild(el('td',used?(used.active_connections+' live, '+formatBytes(used.bytes_up+used.bytes_down)+' sent'):'&mdash;'));
       var status=el('td');
       var badge=el('span',c.enabled?'active':'disabled');
       badge.className='badge '+(c.enabled?'badge-active':'badge-disabled');
@@ -669,10 +683,19 @@ async function loadMtprotoSecrets(){
       var toggle=el('button',c.enabled?'Disable':'Enable');
       toggle.className='btn btn-sm '+(c.enabled?'btn-danger':'btn-success');
       toggle.onclick=function(){toggleMtprotoSecret(c.id,!c.enabled)};
+      var plan=el('select');
+      ['free','basic','pro','unlimited'].forEach(function(name){
+        var opt=el('option',name);opt.value=name;
+        if((c.tier||'unlimited')===name)opt.selected=true;
+        plan.appendChild(opt);
+      });
+      plan.className='btn btn-sm';
+      plan.style.marginRight='5px';
+      plan.onchange=function(){setMtprotoTier(c.id,this.value)};
       var del=el('button','Del');
       del.className='btn btn-sm btn-danger';
       del.onclick=function(){deleteMtprotoSecret(c.id,c.label||c.secret)};
-      actions.appendChild(toggle);actions.appendChild(del);
+      actions.appendChild(plan);actions.appendChild(toggle);actions.appendChild(del);
       row.appendChild(actions);
       tbody.appendChild(row);
     }
@@ -684,7 +707,7 @@ async function loadMtprotoSecrets(){
 
 async function createMtprotoSecret(){
   var msg=document.getElementById('mtproto-msg');
-  var body={label:document.getElementById('m-label').value,kind:document.getElementById('m-kind').value};
+  var body={label:document.getElementById('m-label').value,kind:document.getElementById('m-kind').value,tier:document.getElementById('m-tier').value};
   try{
     var r=await fetch('/api/mtproto-secrets',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
     if(r.ok){
@@ -705,6 +728,14 @@ async function toggleMtprotoSecret(id,enabled){
   var r=await fetch('/api/mtproto-secrets/'+id,{method:'PUT',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:enabled})});
   if(!r.ok){msg.textContent='Error: '+(await r.text());msg.className='msg msg-err';msg.style.display='block'}
   else{msg.style.display='none'}
+  loadMtprotoSecrets();
+}
+
+async function setMtprotoTier(id,tier){
+  var msg=document.getElementById('mtproto-msg');
+  var r=await fetch('/api/mtproto-secrets/'+id,{method:'PUT',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify({tier:tier})});
+  if(!r.ok){msg.textContent='Error: '+(await r.text());msg.className='msg msg-err';msg.style.display='block'}
+  else{msg.textContent='Plan updated.';msg.className='msg msg-ok';msg.style.display='block'}
   loadMtprotoSecrets();
 }
 

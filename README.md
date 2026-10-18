@@ -189,6 +189,18 @@ Each secret is one phone. The dashboard's **Telegram** panel adds, disables and
 revokes them, and a change applies immediately — a revoked phone stops working
 at once, with no restart.
 
+### Tiers
+
+A secret carries the same tier as a SOCKS5 user, and the plan is **enforced**:
+bandwidth is paced at the tier's rate, concurrent sessions are capped, and a
+secret that has moved its data allowance is refused. Without this the Telegram
+relay, which does not pass through the SOCKS5 pipeline, gave every phone an
+unlimited pipe whatever it was on the books for. The panel shows what each phone
+is using.
+
+Expiry is the one part of a tier that does **not** apply to a Telegram secret: it
+has no end date, and a cap or a revocation is how such an account is stopped.
+
 ### Two kinds of secret
 
 | Prefix | Transport | What a prober sees |
@@ -664,8 +676,8 @@ at `/prometheus` with `basic_auth` configured.
 | DELETE | `/api/users/:id` | Delete user |
 | POST | `/api/users/:id/reset` | Reset a user's data usage |
 | GET | `/api/mtproto-secrets` | Telegram secrets, with the listener's bind address |
-| POST | `/api/mtproto-secrets` | Add a secret; it is generated for you |
-| PUT | `/api/mtproto-secrets/:id` | Relabel, or enable/disable, a secret |
+| POST | `/api/mtproto-secrets` | Add a secret with its kind and tier; it is generated for you |
+| PUT | `/api/mtproto-secrets/:id` | Relabel, change the tier, or enable/disable a secret |
 | DELETE | `/api/mtproto-secrets/:id` | Revoke a phone, effective immediately |
 | GET | `/api/vless-clients` | REALITY client UUIDs, and whether they can be managed |
 | POST | `/api/vless-clients` | Add a client; the UUID is generated if omitted |

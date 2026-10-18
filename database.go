@@ -139,6 +139,7 @@ func (s *Store) migrate() error {
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			secret TEXT UNIQUE NOT NULL,
 			label TEXT NOT NULL DEFAULT '',
+			tier TEXT NOT NULL DEFAULT 'unlimited',
 			enabled INTEGER NOT NULL DEFAULT 1,
 			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 		)`,
@@ -148,6 +149,16 @@ func (s *Store) migrate() error {
 		if _, err := s.db.Exec(q); err != nil {
 			return fmt.Errorf("exec %q: %w", q, err)
 		}
+	}
+
+	// Adding a column is the one migration SQLite cannot express as
+	// "if not exists", so it is attempted and the duplicate-column error is the
+	// success case. Everything else stays in the list above, where the database
+	// does the work.
+	if _, err := s.db.Exec(
+		`ALTER TABLE mtproto_secrets ADD COLUMN tier TEXT NOT NULL DEFAULT 'unlimited'`,
+	); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
+		return fmt.Errorf("add mtproto tier column: %w", err)
 	}
 	return nil
 }
@@ -766,17 +777,25 @@ type MtprotoSecret struct {
 	ID        int64  `json:"id"`
 	Secret    string `json:"secret"`
 	Label     string `json:"label"`
+	Tier      string `json:"tier"`
 	Enabled   bool   `json:"enabled"`
 	CreatedAt string `json:"created_at"`
 }
 
-func (s *Store) CreateMtprotoSecret(secret, label string) (*MtprotoSecret, error) {
+// defaultMtprotoTier is what a secret gets when none is chosen: Telegram access
+// stays reachable rather than being throttled to 1Mbps by accident.
+const defaultMtprotoTier = "unlimited"
+
+func (s *Store) CreateMtprotoSecret(secret, label, tier string) (*MtprotoSecret, error) {
 	secret = strings.TrimSpace(strings.ToLower(secret))
 	if _, err := parseMTProtoSecret(secret); err != nil {
 		return nil, err
 	}
+	if _, ok := Tiers[tier]; !ok {
+		tier = defaultMtprotoTier
+	}
 	s.mu.Lock()
-	res, err := s.db.Exec("INSERT INTO mtproto_secrets (secret, label) VALUES (?, ?)", secret, label)
+	res, err := s.db.Exec("INSERT INTO mtproto_secrets (secret, label, tier) VALUES (?, ?, ?)", secret, label, tier)
 	s.mu.Unlock()
 	if err != nil {
 		return nil, err
@@ -794,8 +813,8 @@ func (s *Store) GetMtprotoSecret(id int64) (*MtprotoSecret, error) {
 
 	var sec MtprotoSecret
 	var enabled int
-	err := s.db.QueryRow("SELECT id, secret, label, enabled, created_at FROM mtproto_secrets WHERE id=?", id).
-		Scan(&sec.ID, &sec.Secret, &sec.Label, &enabled, &sec.CreatedAt)
+	err := s.db.QueryRow("SELECT id, secret, label, tier, enabled, created_at FROM mtproto_secrets WHERE id=?", id).
+		Scan(&sec.ID, &sec.Secret, &sec.Label, &sec.Tier, &enabled, &sec.CreatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -807,7 +826,7 @@ func (s *Store) ListMtprotoSecrets() ([]MtprotoSecret, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	rows, err := s.db.Query("SELECT id, secret, label, enabled, created_at FROM mtproto_secrets ORDER BY id")
+	rows, err := s.db.Query("SELECT id, secret, label, tier, enabled, created_at FROM mtproto_secrets ORDER BY id")
 	if err != nil {
 		return nil, err
 	}
@@ -817,7 +836,7 @@ func (s *Store) ListMtprotoSecrets() ([]MtprotoSecret, error) {
 	for rows.Next() {
 		var sec MtprotoSecret
 		var enabled int
-		if err := rows.Scan(&sec.ID, &sec.Secret, &sec.Label, &enabled, &sec.CreatedAt); err != nil {
+		if err := rows.Scan(&sec.ID, &sec.Secret, &sec.Label, &sec.Tier, &enabled, &sec.CreatedAt); err != nil {
 			return nil, err
 		}
 		sec.Enabled = enabled != 0
@@ -826,12 +845,20 @@ func (s *Store) ListMtprotoSecrets() ([]MtprotoSecret, error) {
 	return out, rows.Err()
 }
 
-func (s *Store) UpdateMtprotoSecret(id int64, label *string, enabled *bool) error {
+func (s *Store) UpdateMtprotoSecret(id int64, label *string, tier *string, enabled *bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	if label != nil {
 		if _, err := s.db.Exec("UPDATE mtproto_secrets SET label=? WHERE id=?", *label, id); err != nil {
+			return err
+		}
+	}
+	if tier != nil {
+		if _, ok := Tiers[*tier]; !ok {
+			return fmt.Errorf("unknown tier: %s", *tier)
+		}
+		if _, err := s.db.Exec("UPDATE mtproto_secrets SET tier=? WHERE id=?", *tier, id); err != nil {
 			return err
 		}
 	}

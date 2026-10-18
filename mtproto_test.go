@@ -292,7 +292,7 @@ func TestMTProtoRelayEndToEnd(t *testing.T) {
 
 	s := NewProxyServer(cfg)
 	s.store = newTestStore(t)
-	if _, err := s.store.CreateMtprotoSecret(secret, "test phone"); err != nil {
+	if _, err := s.store.CreateMtprotoSecret(secret, "test phone", "unlimited"); err != nil {
 		t.Fatalf("store secret: %v", err)
 	}
 	if err := s.startMTProto(nil); err != nil {
@@ -398,7 +398,7 @@ func TestMTProtoUnknownSecretRefused(t *testing.T) {
 
 	s := NewProxyServer(cfg)
 	s.store = newTestStore(t)
-	if _, err := s.store.CreateMtprotoSecret(secret, "the only one"); err != nil {
+	if _, err := s.store.CreateMtprotoSecret(secret, "the only one", "unlimited"); err != nil {
 		t.Fatalf("store secret: %v", err)
 	}
 	if err := s.startMTProto(nil); err != nil {
@@ -477,7 +477,7 @@ func TestMTProtoRevokingLastSecretDoesNotMintOne(t *testing.T) {
 
 	s := NewProxyServer(cfg)
 	s.store = newTestStore(t)
-	row, err := s.store.CreateMtprotoSecret(secret, "the only phone")
+	row, err := s.store.CreateMtprotoSecret(secret, "the only phone", "unlimited")
 	if err != nil {
 		t.Fatalf("store: %v", err)
 	}
@@ -525,4 +525,103 @@ func TestMTProtoRevokingLastSecretDoesNotMintOne(t *testing.T) {
 	if waited := time.Since(start); waited > time.Second {
 		t.Errorf("the refusal took %v, so the connection was being relayed rather than refused", waited)
 	}
+}
+
+// A plan that is only written down and never enforced is worse than no plan, so
+// the limits are checked against real sessions.
+func TestMTProtoTierLimitsAreEnforced(t *testing.T) {
+	// A tier whose caps are small enough to reach in a test.
+	tier := Tier{Name: "free", MaxConnections: 1, BandwidthMbps: -1, DataLimitBytes: 2048}
+
+	usage := &mtprotoUsage{}
+	usage.bytesUp.Store(2048)
+
+	if over, limit := mtprotoOverDataCap(usage, tier); !over || limit != 2048 {
+		t.Errorf("a secret at its data cap reported over=%v limit=%d, want true and 2048", over, limit)
+	}
+	usage.bytesDown.Store(1)
+	if over, _ := mtprotoOverDataCap(usage, tier); !over {
+		t.Error("usage below the cap was reported as over it")
+	}
+
+	// An unlimited plan is never over, however much is used.
+	unlimited := Tiers["unlimited"]
+	usage.bytesUp.Store(1 << 40)
+	if over, _ := mtprotoOverDataCap(usage, unlimited); over {
+		t.Error("an unlimited tier reported a data cap")
+	}
+}
+
+// The tiers the dashboard offers have to be the same ones the SOCKS5 port uses,
+// or the two would drift into meaning different things.
+func TestMTProtoSecretDefaultsToUnlimited(t *testing.T) {
+	store := newTestStore(t)
+
+	secret, err := generateMTProtoSecret("dd")
+	if err != nil {
+		t.Fatalf("generate: %v", err)
+	}
+	// No tier given: Telegram access stays reachable instead of being throttled
+	// to 1Mbps by accident.
+	created, err := store.CreateMtprotoSecret(secret, "phone", "")
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if created.Tier != defaultMtprotoTier {
+		t.Errorf("tier = %q, want %q", created.Tier, defaultMtprotoTier)
+	}
+
+	// A tier nobody invented is refused rather than silently stored.
+	if _, err := store.CreateMtprotoSecret(secret+"ff", "other", "platinum"); err == nil {
+		t.Error("an unknown tier was accepted")
+	}
+
+	for name := range Tiers {
+		got, err := store.CreateMtprotoSecret(generateTestSecret(t), name, name)
+		if err != nil {
+			t.Fatalf("tier %q: %v", name, err)
+		}
+		if got.Tier != name {
+			t.Errorf("tier %q stored as %q", name, got.Tier)
+		}
+	}
+}
+
+// An install that already has secrets must gain the column without losing them.
+func TestMTProtoTierColumnMigration(t *testing.T) {
+	store := newTestStore(t)
+
+	secret, err := generateMTProtoSecret("dd")
+	if err != nil {
+		t.Fatalf("generate: %v", err)
+	}
+	store.mu.Lock()
+	_, err = store.db.Exec(
+		"INSERT INTO mtproto_secrets (secret, label) VALUES (?, ?)", secret, "pre-migration")
+	store.mu.Unlock()
+	if err != nil {
+		t.Fatalf("seed an older row: %v", err)
+	}
+
+	// Re-running the migration is what happens on every start.
+	if err := store.migrate(); err != nil {
+		t.Fatalf("migrate again: %v", err)
+	}
+
+	secrets, err := store.ListMtprotoSecrets()
+	if err != nil || len(secrets) != 1 {
+		t.Fatalf("secrets = %+v, %v", secrets, err)
+	}
+	if secrets[0].Tier != defaultMtprotoTier {
+		t.Errorf("an existing secret came back as tier %q, want %q", secrets[0].Tier, defaultMtprotoTier)
+	}
+}
+
+func generateTestSecret(t *testing.T) string {
+	t.Helper()
+	secret, err := generateMTProtoSecret("dd")
+	if err != nil {
+		t.Fatalf("generate: %v", err)
+	}
+	return secret
 }
