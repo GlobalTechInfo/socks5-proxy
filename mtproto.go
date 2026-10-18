@@ -139,10 +139,35 @@ func reverse(b []byte) {
 	}
 }
 
+// prefixConn puts already-read bytes back in front of a connection, so a single
+// byte peeked to tell the transports apart does not cost the handshake the byte
+// it was looking at.
+type prefixConn struct {
+	net.Conn
+	prefix []byte
+}
+
+func (c *prefixConn) Read(p []byte) (int, error) {
+	if len(c.prefix) > 0 {
+		n := copy(p, c.prefix)
+		c.prefix = c.prefix[n:]
+		return n, nil
+	}
+	return c.Conn.Read(p)
+}
+
+// mtprotoConn is what a session needs from whatever carries it: a socket for
+// obfuscated2, or the record layer of fake TLS.
+type mtprotoConn interface {
+	io.Reader
+	io.Writer
+	Close() error
+}
+
 // mtprotoSession is one leg of a proxied conversation: an obfuscated stream in
 // each direction.
 type mtprotoSession struct {
-	conn   net.Conn
+	conn   mtprotoConn
 	toPeer cipher.Stream
 	from   cipher.Stream
 }
@@ -184,7 +209,7 @@ func (s *mtprotoSession) Write(p []byte) (int, error) {
 // With several secrets configured, a stream whose decrypted tag is not one a
 // Telegram client uses means the secret was wrong, and the caller should try the
 // next one.
-func mtprotoAccept(conn net.Conn, secret []byte, strictTag bool) (*mtprotoSession, int, error) {
+func mtprotoAccept(conn mtprotoConn, secret []byte, strictTag bool) (*mtprotoSession, int, error) {
 	init := make([]byte, mtprotoInitLen)
 	if _, err := io.ReadFull(conn, init); err != nil {
 		return nil, 0, fmt.Errorf("read mtproto init: %w", err)
@@ -331,6 +356,9 @@ type mtprotoServer struct {
 	// have since been revoked.
 	secrets   func() mtprotoSecrets
 	overrides map[int]string
+	// cloakHost is the domain the fake TLS reply is built around when a client
+	// does not name one of its own.
+	cloakHost string
 	log       *slog.Logger
 	track     func(net.Conn)
 	untrack   func(net.Conn)
@@ -373,9 +401,7 @@ func (m *mtprotoServer) handle(conn net.Conn) {
 		dialTimeout = 10 * time.Second
 	}
 
-	// Every secret is tried in turn, and the transport tag is always checked.
-	secrets := m.secrets()
-	session, dc, err := m.acceptWithAnySecret(conn, secrets)
+	session, dc, err := m.accept(conn)
 	if err != nil {
 		log.Debug("mtproto handshake refused", "error", err)
 		return
@@ -411,11 +437,60 @@ func (m *mtprotoServer) handle(conn net.Conn) {
 	closeBoth()
 }
 
+// accept reads the client's opening and works out which transport it speaks.
+// A TLS handshake starts 0x16; anything else is obfuscated2. The choice comes
+// from the first byte, which is what lets one port serve both.
+func (m *mtprotoServer) accept(conn net.Conn) (*mtprotoSession, int, error) {
+	secrets := m.secrets()
+
+	peek := make([]byte, 1)
+	if _, err := io.ReadFull(conn, peek); err != nil {
+		return nil, 0, err
+	}
+
+	// The peeked byte is the first byte of whichever handshake follows, so it is
+	// pushed back in front of the stream rather than consumed.
+	conn = &prefixConn{Conn: conn, prefix: peek}
+
+	if peek[0] == fakeTLSRecordHandshake {
+		// The hello itself carries the HMAC, so the secret is settled before
+		// anything else is read.
+		wrapped, hello, err := fakeTLSHandshake(conn, secrets, time.Now(), m.cloakHost)
+		if err != nil {
+			return nil, 0, err
+		}
+		m.log.Info("fake tls hello accepted", "domain", hello.Domain)
+		session, dc, err := m.acceptWithSecret(wrapped, hello.Secret)
+		return session, dc, err
+	}
+
+	return m.acceptWithAnySecret(conn, secrets)
+}
+
+// acceptWithSecret runs the obfuscated2 handshake with a secret already known,
+// which is the case after a fake TLS hello proved it.
+func (m *mtprotoServer) acceptWithSecret(conn mtprotoConn, secret []byte) (*mtprotoSession, int, error) {
+	init := make([]byte, mtprotoInitLen)
+	if _, err := io.ReadFull(conn, init); err != nil {
+		return nil, 0, err
+	}
+	toPeer, fromPeer, err := mtprotoStreams(init, secret)
+	if err != nil {
+		return nil, 0, err
+	}
+	toPeer, fromPeer = fromPeer, toPeer
+
+	probe := make([]byte, mtprotoInitLen)
+	fromPeer.XORKeyStream(probe, init)
+	dc := int(binary.LittleEndian.Uint16(probe[60:62]))
+	return &mtprotoSession{conn: conn, toPeer: toPeer, from: fromPeer}, dc, nil
+}
+
 // acceptWithAnySecret finds the secret the client is using. Each attempt reads
 // from the same connection, so a wrong secret only costs the client opening
 // bytes: the server has consumed exactly the same 64 bytes either way, and the
 // stream is discarded between attempts.
-func (m *mtprotoServer) acceptWithAnySecret(conn net.Conn, secrets mtprotoSecrets) (*mtprotoSession, int, error) {
+func (m *mtprotoServer) acceptWithAnySecret(conn mtprotoConn, secrets mtprotoSecrets) (*mtprotoSession, int, error) {
 	if len(secrets) == 0 {
 		return nil, 0, errors.New("no MTProto secret is configured")
 	}
@@ -466,20 +541,53 @@ func copyStream(dst io.Writer, src io.Reader, log *slog.Logger) {
 
 // ─── Secrets ────────────────────────────────────────────────────────────────
 
-// generateMTProtoSecret returns a shareable proxy secret: the dd prefix marks it
-// as an obfuscated2 secret, which is what the Telegram apps expect to paste.
-func generateMTProtoSecret() (string, error) {
+// A secret says which transport it belongs to: the dd prefix is obfuscated2,
+// the ee prefix is the same stream wearing a TLS handshake. Telegram clients
+// choose the transport from the prefix, so the server must too.
+func mtprotoSecretKind(stored string) string {
+	if strings.HasPrefix(stored, "ee") {
+		return "ee"
+	}
+	return "dd"
+}
+
+// generateMTProtoSecret returns a shareable proxy secret. The prefix is
+// Telegram's: dd for obfuscated2, ee for the same stream inside a TLS handshake,
+// and the client picks the transport from it.
+func generateMTProtoSecret(kind string) (string, error) {
+	return generateMTProtoSecretOfKind(newSecretKind(kind))
+}
+
+// newSecretKind picks the kind of secret to generate, for a network where plain
+// obfuscated2 is blocked and fake TLS is wanted instead.
+func newSecretKind(configured string) string {
+	if strings.EqualFold(strings.TrimSpace(configured), "ee") {
+		return "ee"
+	}
+	return "dd"
+}
+
+func generateMTProtoSecretOfKind(kind string) (string, error) {
 	raw := make([]byte, mtprotoSecretLen)
 	if _, err := rand.Read(raw); err != nil {
 		return "", err
 	}
-	return "dd" + hex.EncodeToString(raw), nil
+	if kind != "ee" {
+		kind = "dd"
+	}
+	return kind + hex.EncodeToString(raw), nil
 }
 
 // parseMTProtoSecret turns a stored secret into its 16 key bytes. The dd prefix
 // is Telegram's, not ours, and takes no part in the cryptography.
 func parseMTProtoSecret(stored string) ([]byte, error) {
-	key, err := hex.DecodeString(strings.TrimPrefix(stored, "dd"))
+	stored = strings.ToLower(strings.TrimSpace(stored))
+	// Both prefixes are Telegram's markers, not part of the key.
+	trimmed := strings.TrimPrefix(stored, "dd")
+	if trimmed == stored {
+		trimmed = strings.TrimPrefix(stored, "ee")
+	}
+	key, err := hex.DecodeString(trimmed)
 	if err != nil {
 		return nil, fmt.Errorf("%q is not a hex secret", stored)
 	}
@@ -512,6 +620,7 @@ func (s *ProxyServer) startMTProto(secrets mtprotoSecrets) error {
 		cfg:       s.cfg,
 		secrets:   s.mtprotoLiveSecrets,
 		overrides: parseMTProtoDCOverrides(s.cfg.MTProtoDCs),
+		cloakHost: orDefault(s.cfg.MTProtoFakeHost, "www.cloudflare.com"),
 		log:       s.logger,
 		track:     s.trackConn,
 		untrack:   s.untrackConn,
@@ -552,7 +661,7 @@ func (s *ProxyServer) loadMTProtoSecrets(fallback mtprotoSecrets, generateIfEmpt
 		}
 	}
 	if len(out) == 0 && generateIfEmpty && s.store != nil {
-		secret, err := generateMTProtoSecret()
+		secret, err := generateMTProtoSecret(s.cfg.MTProtoSecretKind)
 		if err == nil {
 			if _, err := s.store.CreateMtprotoSecret(secret, "generated"); err == nil {
 				if key, kerr := parseMTProtoSecret(secret); kerr == nil {

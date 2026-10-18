@@ -11,7 +11,7 @@ Deploys on any PaaS, including the ones that expose only a single HTTP endpoint.
 - **Single-Port Multiplexing** - SOCKS5, TLS, dashboards and the tunnel share one port, so it runs on Render/Koyeb/Heroku/Northflank where raw TCP never reaches the app
 - **WebSocket Tunnel** - Carries SOCKS5 over an HTTP upgrade for platforms whose edge terminates TLS; ships with a matching client
 - **REALITY** - Xray front door that presents a real website's certificate to an active prober; sessions still land in the SOCKS5 pipeline
-- **MTProto** - Telegram's own protocol on its own port, with per-phone secrets managed in the dashboard
+- **MTProto** - Telegram's own protocol on its own port, with per-phone secrets managed in the dashboard, in plain obfuscated2 or fake TLS
 - **VLESS Client Management** - Add, disable and revoke REALITY UUIDs from the dashboard; xray is reloaded in place, no restart
 - **Client Mode** - Same binary exposes a local SOCKS5 port that relays through the tunnel
 - **User Management** - Create, update, delete users with tier-based limits
@@ -189,12 +189,28 @@ Each secret is one phone. The dashboard's **Telegram** panel adds, disables and
 revokes them, and a change applies immediately — a revoked phone stops working
 at once, with no restart.
 
-This is obfuscated2 (the `dd` secret Telegram apps expect). Two honest limits:
+### Two kinds of secret
 
-- **The camouflage here is Telegram's, not ours.** The transport looks like
-  random bytes, which is what every Telegram proxy looks like on the wire. If you
-  need the port to look like a website to an active prober, that is REALITY's
-  job — and Telegram does not speak VLESS.
+| Prefix | Transport | What a prober sees |
+|---|---|---|
+| `dd…` | obfuscated2 | Random-looking bytes, which is what every Telegram proxy looks like |
+| `ee…` | fake TLS | A TLS handshake with a real certificate, then the same stream inside it |
+
+Both are managed the same way, and one port serves both: the client says which
+it wants in the secret's prefix. `MTPROTO_SECRET_KIND=ee` makes newly generated
+secrets fake TLS; `MTPROTO_FAKE_HOST` sets the domain the reply is built around
+when a client does not name one.
+
+The fake TLS certificate is generated per domain rather than shipped as a
+constant — a hardcoded certificate is a key everybody shares, and the client does
+not validate the chain in this mode.
+
+Two honest limits:
+
+- **Without an `ee` secret the port looks like noise.** That is the same as every
+  Telegram proxy. For a port that must look like a real site, use an `ee` secret
+  — and know that it is fake TLS, so a censor comparing it against the real site
+  it claims to be can still tell the difference.
 - **Telegram's addresses are compiled in**, which is what every MTProxy does.
   If they are unreachable from your network, `MTPROTO_DCS` points them
   somewhere else.
@@ -402,6 +418,8 @@ Edit `config.json` or use environment variables (env vars override config file):
 | `MTPROTO_ENABLED` | false | Telegram front door; generates its first secret on first start |
 | `MTPROTO_BIND` | 0.0.0.0:8443 | Telegram port. Avoid 443 when REALITY has it |
 | `MTPROTO_DCS` | unset | `dc=address,dc=address`, only when Telegram's own addresses are unreachable |
+| `MTPROTO_SECRET_KIND` | dd | Kind of secret to generate: `dd` obfuscated2, `ee` fake TLS |
+| `MTPROTO_FAKE_HOST` | www.cloudflare.com | Domain the fake TLS reply is built around |
 | `MAX_CONNECTIONS` | 1000 | Max simultaneous connections |
 | `ADMIN_USER` | admin | Admin dashboard username |
 | `ADMIN_PASS` | changeme | Admin dashboard password |

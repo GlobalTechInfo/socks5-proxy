@@ -64,6 +64,10 @@ const (
 	fakeTLSTimeSkew = 8 * time.Hour
 )
 
+// fakeTLSVersion3 is what both sides announce. Matching the version the
+// reference client uses is part of looking ordinary.
+var fakeTLSVersion3 = [2]byte{0x03, 0x03}
+
 // fakeTLSRecord is one TLS record.
 type fakeTLSRecord struct {
 	Type byte
@@ -81,19 +85,31 @@ func writeFakeTLSRecord(w io.Writer, recType byte, data []byte) error {
 }
 
 func readFakeTLSRecord(r io.Reader) (fakeTLSRecord, error) {
+	rec, _, err := readFakeTLSRecordRaw(r)
+	return rec, err
+}
+
+// readFakeTLSRecordRaw also returns the bytes exactly as they arrived, header
+// included. The client's HMAC is taken over those precise bytes, so anything
+// that re-serialises the record first computes a different digest and rejects
+// every real client.
+func readFakeTLSRecordRaw(r io.Reader) (fakeTLSRecord, []byte, error) {
 	var header [5]byte
 	if _, err := io.ReadFull(r, header[:]); err != nil {
-		return fakeTLSRecord{}, err
+		return fakeTLSRecord{}, nil, err
 	}
 	length := binary.BigEndian.Uint16(header[3:])
 	if length > fakeTLSMaxRecord {
-		return fakeTLSRecord{}, fmt.Errorf("fake tls record is %d bytes, too big", length)
+		return fakeTLSRecord{}, nil, fmt.Errorf("fake tls record is %d bytes, too big", length)
 	}
 	data := make([]byte, length)
 	if _, err := io.ReadFull(r, data); err != nil {
-		return fakeTLSRecord{}, err
+		return fakeTLSRecord{}, nil, err
 	}
-	return fakeTLSRecord{Type: header[0], Data: data}, nil
+	raw := make([]byte, 0, len(header)+len(data))
+	raw = append(raw, header[:]...)
+	raw = append(raw, data...)
+	return fakeTLSRecord{Type: header[0], Data: data}, raw, nil
 }
 
 // fakeTLSClientHello is what the handshake yields: the shared secret that
@@ -109,8 +125,8 @@ type fakeTLSClientHello struct {
 //
 // secrets is tried in turn: the client's random is the HMAC of its own hello
 // under the secret it was given, so only the right key produces a match.
-func fakeTLSHandshake(conn net.Conn, secrets mtprotoSecrets, now time.Time) (*fakeTLSRecordConn, *fakeTLSClientHello, error) {
-	record, err := readFakeTLSRecord(conn)
+func fakeTLSHandshake(conn net.Conn, secrets mtprotoSecrets, now time.Time, cloakHost string) (*fakeTLSRecordConn, *fakeTLSClientHello, error) {
+	record, raw, err := readFakeTLSRecordRaw(conn)
 	if err != nil {
 		return nil, nil, fmt.Errorf("read fake tls hello: %w", err)
 	}
@@ -121,16 +137,12 @@ func fakeTLSHandshake(conn net.Conn, secrets mtprotoSecrets, now time.Time) (*fa
 		return nil, nil, fmt.Errorf("expected a ClientHello, got message type %#x", record.Data[0])
 	}
 
-	// The HMAC covers the record exactly as it arrived, so the bytes are kept
-	// intact and only a copy is modified for the comparison.
-	hello := record.Data[4:]
+	// The HMAC is taken over the record as it arrived, header included, with the
+	// random zeroed. Everything after the handshake is parsed from the same
+	// bytes, so the offsets stay in one place.
+	domain := fakeTLSHelloDomain(record.Data[4:])
 
-	domain, err := fakeTLSHelloDomain(hello)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	matched, err := fakeTLSMatchSecret(hello, secrets, now)
+	matched, err := fakeTLSMatchSecret(raw, secrets, now)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -139,9 +151,9 @@ func fakeTLSHandshake(conn net.Conn, secrets mtprotoSecrets, now time.Time) (*fa
 		Secret: matched,
 		Domain: domain,
 	}
-	copy(info.Random[:], hello[2:34])
+	copy(info.Random[:], raw[fakeTLSServerRandomOffset:fakeTLSServerRandomOffset+32])
 
-	if err := writeFakeTLSServerResponse(conn, info, matched); err != nil {
+	if err := writeFakeTLSServerResponse(conn, info, matched, cloakHost); err != nil {
 		return nil, nil, fmt.Errorf("write fake tls response: %w", err)
 	}
 	return newFakeTLSRecordConn(conn), info, nil
@@ -150,23 +162,24 @@ func fakeTLSHandshake(conn net.Conn, secrets mtprotoSecrets, now time.Time) (*fa
 // fakeTLSMatchSecret finds the secret a hello was made with. The random is an
 // HMAC over the hello with itself zeroed, so a mismatch is simply "no match" --
 // there is nothing to give up on, and nothing leaks beyond the timing.
-func fakeTLSMatchSecret(hello []byte, secrets mtprotoSecrets, now time.Time) ([]byte, error) {
-	if len(hello) < 34 {
-		return nil, fmt.Errorf("ClientHello is %d bytes, too short to carry a random", len(hello))
+func fakeTLSMatchSecret(raw []byte, secrets mtprotoSecrets, now time.Time) ([]byte, error) {
+	const randomAt = fakeTLSServerRandomOffset
+	if len(raw) < randomAt+32 {
+		return nil, fmt.Errorf("ClientHello is %d bytes, too short to carry a random", len(raw))
 	}
 	var presented [32]byte
-	copy(presented[:], hello[2:34])
+	copy(presented[:], raw[randomAt:randomAt+32])
 
-	// Zero the random in place for the HMAC, then put it back.
-	original := append([]byte(nil), hello[2:34]...)
-	defer copy(hello[2:34], original)
+	// Zero the random for the HMAC, then put the client's bytes back.
+	original := append([]byte(nil), raw[randomAt:randomAt+32]...)
+	defer copy(raw[randomAt:randomAt+32], original)
 
 	for _, secret := range secrets {
-		for i := 2; i < 34; i++ {
-			hello[i] = 0
+		for i := randomAt; i < randomAt+32; i++ {
+			raw[i] = 0
 		}
 		mac := hmac.New(sha256.New, secret)
-		mac.Write(hello)
+		mac.Write(raw)
 		want := mac.Sum(nil)
 
 		if !hmac.Equal(want[:28], presented[:28]) {
@@ -183,66 +196,55 @@ func fakeTLSMatchSecret(hello []byte, secrets mtprotoSecrets, now time.Time) ([]
 	return nil, errors.New("no configured secret matched this fake TLS hello")
 }
 
-// fakeTLSHelloDomain pulls the server name out of the ClientHello's extensions.
-// It is what the client claims to be visiting, which is also what a prober would
-// believe it was reaching, so the reply has to look like it belongs to it.
-func fakeTLSHelloDomain(hello []byte) (string, error) {
-	pos := 2 + 32 // client version and random
-
-	if pos >= len(hello) {
-		return "", errors.New("ClientHello ended before the session id")
-	}
-	sessionLen := int(hello[pos])
-	pos += 1 + sessionLen
-
-	if pos+2 > len(hello) {
-		return "", errors.New("ClientHello ended before the cipher suites")
-	}
-	suitesLen := int(binary.BigEndian.Uint16(hello[pos:]))
-	pos += 2 + suitesLen
-
-	if pos >= len(hello) {
-		return "", errors.New("ClientHello ended before the compression methods")
-	}
-	compressionLen := int(hello[pos])
-	pos += 1 + compressionLen
-
-	if pos+2 > len(hello) {
-		// No extensions at all: the client will not care, and neither does a
-		// prober reading a site that speaks no extensions.
-		return "", nil
-	}
-	extensionsLen := int(binary.BigEndian.Uint16(hello[pos:]))
-	pos += 2
-	end := pos + extensionsLen
-	if end > len(hello) {
-		return "", errors.New("ClientHello extensions overrun the message")
-	}
-
-	for pos+4 <= end {
-		extType := binary.BigEndian.Uint16(hello[pos:])
-		extLen := int(binary.BigEndian.Uint16(hello[pos+2:]))
-		body := pos + 4
-		if body+extLen > end {
-			return "", errors.New("ClientHello extension overruns the message")
+// fakeTLSHelloDomain pulls the server name out of the ClientHello.
+//
+// It scans for a well-formed server_name extension rather than walking the
+// message field by field, because the hellos these clients send are built by
+// hand and do not always agree with their own length fields. A prober reading
+// the reply expects a name in there; nothing depends on it being right, so a
+// hello that does not contain one is not an error -- the caller falls back to a
+// domain of its own.
+func fakeTLSHelloDomain(hello []byte) string {
+	for i := 0; i+5 < len(hello); i++ {
+		// Extension type 0x0000 is server_name.
+		if hello[i] != 0x00 || hello[i+1] != 0x00 {
+			continue
 		}
-		// 0x0000 is server_name.
-		if extType == 0x0000 && extLen > 5 {
-			nameLen := int(binary.BigEndian.Uint16(hello[body+3:]))
-			if 5+nameLen <= extLen {
-				return string(hello[body+5 : body+5+nameLen]), nil
-			}
+		extLen := int(binary.BigEndian.Uint16(hello[i+2:]))
+		body := i + 4
+		if extLen < 5 || body+extLen > len(hello) {
+			continue
 		}
-		pos = body + extLen
+		nameLen := int(binary.BigEndian.Uint16(hello[body+3:]))
+		if 5+nameLen > extLen || nameLen == 0 || nameLen > 253 {
+			continue
+		}
+		name := string(hello[body+5 : body+5+nameLen])
+		if looksLikeHostname(name) {
+			return name
+		}
 	}
-	return "", nil
+	return ""
+}
+
+func looksLikeHostname(name string) bool {
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+		case c == '.' || c == '-' || c == '_':
+		default:
+			return false
+		}
+	}
+	return name != ""
 }
 
 // writeFakeTLSServerResponse sends the three records a client expects: the
 // ServerHello, the ChangeCipherSpec, and a certificate record carrying the
 // domain the client asked for.
-func writeFakeTLSServerResponse(w io.Writer, info *fakeTLSClientHello, secret []byte) error {
-	records := buildFakeTLSResponse(info, secret)
+func writeFakeTLSServerResponse(w io.Writer, info *fakeTLSClientHello, secret []byte, cloakHost string) error {
+	records := buildFakeTLSResponse(info, secret, cloakHost)
 
 	// The client's random goes into the digest so that a mirror replaying
 	// recorded bytes cannot pass as the real thing.
@@ -263,10 +265,15 @@ func writeFakeTLSServerResponse(w io.Writer, info *fakeTLSClientHello, secret []
 
 // buildFakeTLSResponse assembles the reply records with the server's random
 // left as zeros for the caller to fill in.
-func buildFakeTLSResponse(info *fakeTLSClientHello, secret []byte) []byte {
+func buildFakeTLSResponse(info *fakeTLSClientHello, secret []byte, cloakHost string) []byte {
 	domain := info.Domain
 	if domain == "" {
-		domain = "example.com"
+		// No usable name in the hello, so answer with the one this proxy is
+		// configured to look like. Either way the bytes on the wire are a name.
+		domain = cloakHost
+	}
+	if domain == "" {
+		domain = "www.cloudflare.com"
 	}
 
 	var body bytes.Buffer
@@ -322,9 +329,8 @@ func fakeTLSCertificateExtension(domain string) []byte {
 // fakeTLSConn is the record layer after the handshake: MTProto bytes in and out,
 // TLS records on the wire.
 type fakeTLSRecordConn struct {
-	conn       net.Conn
-	buf        []byte
-	sentCipher bool
+	conn net.Conn
+	buf  []byte
 }
 
 func newFakeTLSRecordConn(conn net.Conn) *fakeTLSRecordConn {
@@ -354,15 +360,13 @@ func (c *fakeTLSRecordConn) Read(p []byte) (int, error) {
 }
 
 func (c *fakeTLSRecordConn) Write(p []byte) (int, error) {
-	// A real client sends ChangeCipherSpec before its first application record,
-	// so the server does too: this is a camouflage, and the shape of the traffic
-	// is the point.
-	if !c.sentCipher {
-		if err := writeFakeTLSRecord(c.conn, fakeTLSRecordChangeCipherSpec, []byte{0x01}); err != nil {
-			return 0, err
-		}
-		c.sentCipher = true
-	}
+	// No ChangeCipherSpec is sent before the first application record. It looks
+	// more like a TLS handshake without it, but the reference client treats a
+	// ChangeCipherSpec as stream content rather than as handshake framing, so
+	// sending one injects a stray 0x01 at the head of the MTProto stream and
+	// desynchronises everything after it. The camouflage is not worth corrupting
+	// the stream it is supposed to be hiding.
+	//
 	// Records are limited in size, so a large write becomes several records.
 	written := 0
 	for written < len(p) {

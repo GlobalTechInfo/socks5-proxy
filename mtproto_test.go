@@ -238,7 +238,7 @@ func (e errUnexpectedDC) Error() string { return "unexpected datacenter " + strc
 // obfuscated2 connects to our listener with a secret from the database, and the
 // bytes arrive at the datacenter it asked for.
 func TestMTProtoRelayEndToEnd(t *testing.T) {
-	secret, err := generateMTProtoSecret()
+	secret, err := generateMTProtoSecret("dd")
 	if err != nil {
 		t.Fatalf("generate secret: %v", err)
 	}
@@ -384,7 +384,7 @@ func TestMTProtoWriteSurvivesShortWrites(t *testing.T) {
 // A client without a configured secret must get nowhere, and the listener must
 // stay up for the next one.
 func TestMTProtoUnknownSecretRefused(t *testing.T) {
-	secret, err := generateMTProtoSecret()
+	secret, err := generateMTProtoSecret("dd")
 	if err != nil {
 		t.Fatalf("generate: %v", err)
 	}
@@ -431,7 +431,7 @@ func TestMTProtoUnknownSecretRefused(t *testing.T) {
 }
 
 func TestMTProtoSecretFormat(t *testing.T) {
-	secret, err := generateMTProtoSecret()
+	secret, err := generateMTProtoSecret("dd")
 	if err != nil {
 		t.Fatalf("generate: %v", err)
 	}
@@ -454,7 +454,7 @@ func TestMTProtoSecretFormat(t *testing.T) {
 		}
 	}
 	// Two secrets must differ, or one would be shared by everyone.
-	other, _ := generateMTProtoSecret()
+	other, _ := generateMTProtoSecret("dd")
 	if other == secret {
 		t.Error("generated the same secret twice")
 	}
@@ -464,7 +464,7 @@ func TestMTProtoSecretFormat(t *testing.T) {
 // minting a replacement would undo the decision and hand out a credential the
 // operator never asked for -- and the dashboard change would look like it worked.
 func TestMTProtoRevokingLastSecretDoesNotMintOne(t *testing.T) {
-	secret, err := generateMTProtoSecret()
+	secret, err := generateMTProtoSecret("dd")
 	if err != nil {
 		t.Fatalf("generate: %v", err)
 	}
