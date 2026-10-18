@@ -8,6 +8,8 @@
   "mtproto_enabled": false,
   "mtproto_bind": "0.0.0.0:8443",
   "mtproto_dcs": "",
+  "mtproto_secret_kind": "dd",
+  "mtproto_fake_host": "www.cloudflare.com",
   "username": "changeme",
   "password": "changeme",
   "whitelist": [],

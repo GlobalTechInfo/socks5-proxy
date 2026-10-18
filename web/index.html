@@ -267,12 +267,21 @@ document.addEventListener('DOMContentLoaded',function(){
     <p style="color:#6b7280;font-size:13px;margin:0 0 12px">
       Each secret is one Telegram client. Add one, then paste it into the phone
       under Settings &rarr; Data and Storage &rarr; Proxy. Changes take effect at
-      once; nothing restarts.
+      once; nothing restarts. A <code>dd</code> secret is obfuscated2; an
+      <code>ee</code> secret carries the same stream inside a TLS handshake,
+      which makes the port look like a website to someone scanning it.
     </p>
     <div class="form-grid">
       <div class="field">
         <label for="m-label">Label (whose phone is this?)</label>
         <input type="text" id="m-label" placeholder="e.g. alice's phone">
+      </div>
+      <div class="field">
+        <label for="m-kind">Kind</label>
+        <select id="m-kind">
+          <option value="ee">ee &mdash; fake TLS (port looks like a website)</option>
+          <option value="dd">dd &mdash; obfuscated2 (plain)</option>
+        </select>
       </div>
     </div>
     <button class="btn btn-primary" onclick="createMtprotoSecret()">Add Secret</button>
@@ -675,7 +684,7 @@ async function loadMtprotoSecrets(){
 
 async function createMtprotoSecret(){
   var msg=document.getElementById('mtproto-msg');
-  var body={label:document.getElementById('m-label').value};
+  var body={label:document.getElementById('m-label').value,kind:document.getElementById('m-kind').value};
   try{
     var r=await fetch('/api/mtproto-secrets',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
     if(r.ok){

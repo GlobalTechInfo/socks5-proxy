@@ -84,6 +84,10 @@ type Config struct {
 	MTProtoBind    string `json:"mtproto_bind"`
 	// Datacenter overrides, as dc=address,dc=address.
 	MTProtoDCs string `json:"mtproto_dcs"`
+	// Which kind of secret to generate: dd (obfuscated2) or ee (fake TLS).
+	MTProtoSecretKind string `json:"mtproto_secret_kind"`
+	// The domain the fake TLS reply is built around when the client names none.
+	MTProtoFakeHost string `json:"mtproto_fake_host"`
 
 	// SOCKS5 UDP ASSOCIATE. TCP-only was the original behaviour, and a proxy
 	// that cannot carry UDP breaks DNS lookups and QUIC unless the client falls
@@ -134,6 +138,8 @@ func DefaultConfig() Config {
 		TunnelRateRPS:          5,
 		UDPEnabled:             true,
 		MTProtoBind:            defaultMTProtoBind,
+		MTProtoSecretKind:      "dd",
+		MTProtoFakeHost:        "www.cloudflare.com",
 		RealityBind:            defaultRealityBind,
 		RealityDest:            defaultRealityDest,
 		RealityXrayBin:         "xray",
@@ -298,6 +304,12 @@ func LoadConfig(filename string) (Config, error) {
 	}
 	if v := os.Getenv("MTPROTO_DCS"); v != "" {
 		cfg.MTProtoDCs = v
+	}
+	if v := os.Getenv("MTPROTO_SECRET_KIND"); v != "" {
+		cfg.MTProtoSecretKind = v
+	}
+	if v := os.Getenv("MTPROTO_FAKE_HOST"); v != "" {
+		cfg.MTProtoFakeHost = v
 	}
 
 	// REALITY. Comma-separated lists accept more than one SNI, short id or
@@ -1969,12 +1981,21 @@ func (s *ProxyServer) adminHandler() http.Handler {
 			}
 			var req struct {
 				Label string `json:"label"`
+				// The kind is per secret rather than only a server-wide default,
+				// so both kinds can be handed out from the same running service.
+				Kind string `json:"kind"`
 			}
 			if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req); err != nil {
 				http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
 				return
 			}
-			secret, err := generateMTProtoSecret()
+			s.configMu.RLock()
+			kind := s.cfg.MTProtoSecretKind
+			s.configMu.RUnlock()
+			if req.Kind != "" {
+				kind = req.Kind
+			}
+			secret, err := generateMTProtoSecret(kind)
 			if err != nil {
 				http.Error(w, "could not generate a secret: "+err.Error(), http.StatusInternalServerError)
 				return
