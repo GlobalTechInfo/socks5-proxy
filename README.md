@@ -371,6 +371,23 @@ Setting `REALITY_CLIENT_IDS` still works, and pins the list from configuration:
 while it is set the panel says so and refuses changes rather than accepting edits
 that would quietly do nothing.
 
+### Billing a client to a user of its own
+
+By default every REALITY session arrives on the service's shared SOCKS
+credentials, so no tier, limit or counter applies to it. The **Meter it** button
+on a client creates a SOCKS user for that client alone and routes its sessions
+there through an xray rule keyed on the client's email. From then on its traffic
+is metered, limited and counted like anyone else's, and the user shows up in the
+user list where its tier can be changed like any other.
+
+The credentials xray needs are **derived**, not stored: a per-install secret
+produces them on every render, so only the hash sits in the users table and no
+readable password is kept anywhere.
+
+One cost to know about: each linked client adds an outbound and a routing rule to
+the xray config, so a very large number of clients makes that config big. A few
+hundred is fine; beyond that, this wants rethinking rather than growing.
+
 `REALITY_BIND` defaults to `0.0.0.0:443`, which is IPv4 only. On an IPv6-only
 host set it to `[::]:443`.
 
@@ -681,7 +698,7 @@ at `/prometheus` with `basic_auth` configured.
 | DELETE | `/api/mtproto-secrets/:id` | Revoke a phone, effective immediately |
 | GET | `/api/vless-clients` | REALITY client UUIDs, and whether they can be managed |
 | POST | `/api/vless-clients` | Add a client; the UUID is generated if omitted |
-| PUT | `/api/vless-clients/:id` | Relabel, or enable/disable, a client |
+| PUT | `/api/vless-clients/:id` | Relabel, enable/disable, or bill a client to a SOCKS user of its own |
 | DELETE | `/api/vless-clients/:id` | Revoke a client, effective immediately |
 | GET | `/api/top-destinations?n=10` | Most-visited destinations |
 | GET | `/api/history/stats?n=60` | Historical connection/byte counters |

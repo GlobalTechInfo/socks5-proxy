@@ -69,8 +69,29 @@ type realityKeys struct {
 	PublicKey  string
 	ShortID    string
 	ClientIDs  []string
+	// Links are the clients that are billed to a SOCKS user, keyed by UUID.
+	// Without one, a client's traffic lands on the shared credentials and no
+	// tier applies to it.
+	Links      map[string]realityLinkedClient
 	ServerName string
 }
+
+// realityLinkedClient is one client with a SOCKS user behind it. The password is
+// derived rather than stored, so it can be put in an xray config without keeping
+// a readable one anywhere.
+type realityLinkedClient struct {
+	ID       int64
+	Username string
+	Password string
+}
+
+// vlessClientEmail is the name xray knows a client by, and what a routing rule
+// matches on. It has to stay stable across re-renders: a client whose email
+// moved would lose its route without anything looking wrong.
+func vlessClientEmail(id int64) string { return fmt.Sprintf("vless-%d", id) }
+
+// vlessOutboundTag names the per-client socks outbound.
+func vlessOutboundTag(id int64) string { return fmt.Sprintf("proxy-%d", id) }
 
 // ─── Config rendering ───────────────────────────────────────────────────────
 //
@@ -93,6 +114,7 @@ type realityRoutingConfig struct {
 type realityRoutingRule struct {
 	Type        string   `json:"type"`
 	InboundTag  []string `json:"inboundTag"`
+	User        []string `json:"user,omitempty"`
 	OutboundTag string   `json:"outboundTag"`
 }
 
@@ -216,9 +238,35 @@ func renderRealityServerConfig(cfg Config, k realityKeys) ([]byte, error) {
 	out := realityServerConfig{}
 	out.Log.LogLevel = "warning"
 
+	// A client linked to a SOCKS user gets an email, and xray routes its
+	// sessions by that email to an outbound carrying that user's credentials.
+	// An unlinked client falls through to the shared outbound, exactly as before.
 	clients := make([]realityClient, 0, len(k.ClientIDs))
+	perUserOutbounds := make([]realityOutbound, 0, len(k.Links))
+	rules := make([]realityRoutingRule, 0, len(k.Links)+1)
 	for _, id := range k.ClientIDs {
-		clients = append(clients, realityClient{ID: id})
+		entry := realityClient{ID: id}
+		link, linked := k.Links[id]
+		if linked {
+			entry.Email = vlessClientEmail(link.ID)
+			perUserOutbounds = append(perUserOutbounds, realityOutbound{
+				Tag:      vlessOutboundTag(link.ID),
+				Protocol: "socks",
+				Settings: &realityOutboundSettings{
+					Servers: []realitySocksServer{{
+						Address: "127.0.0.1",
+						Port:    cfg.ProxyPort,
+						Users:   []realityUser{{User: link.Username, Pass: link.Password}},
+					}},
+				},
+			})
+			rules = append(rules, realityRoutingRule{
+				Type:        "field",
+				User:        []string{entry.Email},
+				OutboundTag: vlessOutboundTag(link.ID),
+			})
+		}
+		clients = append(clients, entry)
 	}
 
 	inbound := realityInbound{
@@ -262,17 +310,17 @@ func renderRealityServerConfig(cfg Config, k realityKeys) ([]byte, error) {
 		socksOut.Settings.Servers[0].Users = []realityUser{{User: cfg.Username, Pass: cfg.Password}}
 	}
 
-	out.Outbounds = []realityOutbound{
-		socksOut,
-		{Tag: realityDirectTag, Protocol: "freedom"},
-	}
-	out.Routing = realityRoutingConfig{
-		Rules: []realityRoutingRule{{
-			Type:        "field",
-			InboundTag:  []string{realityInboundTag},
-			OutboundTag: realitySocksTag,
-		}},
-	}
+	out.Outbounds = append([]realityOutbound{socksOut}, perUserOutbounds...)
+	out.Outbounds = append(out.Outbounds, realityOutbound{Tag: realityDirectTag, Protocol: "freedom"})
+
+	// The shared outbound stays the fallback, so a client that is not linked
+	// keeps working rather than being refused.
+	rules = append(rules, realityRoutingRule{
+		Type:        "field",
+		InboundTag:  []string{realityInboundTag},
+		OutboundTag: realitySocksTag,
+	})
+	out.Routing = realityRoutingConfig{Rules: rules}
 
 	return json.MarshalIndent(out, "", "  ")
 }
@@ -489,6 +537,8 @@ func resolveRealityKeys(cfg Config, persisted map[string]string, store *Store, l
 		}
 	}
 
+	keys.Links = loadRealityLinks(store, logger)
+
 	if store != nil {
 		if generatedKey {
 			saveRealitySetting(store, logger, dbRealityPrivateKey, keys.PrivateKey)
@@ -499,6 +549,49 @@ func resolveRealityKeys(cfg Config, persisted map[string]string, store *Store, l
 	}
 
 	return keys, nil
+}
+
+// loadRealityLinks reads which clients are billed to a SOCKS user, and derives
+// the password xray needs to authenticate as them.
+func loadRealityLinks(store *Store, logger *slog.Logger) map[string]realityLinkedClient {
+	out := map[string]realityLinkedClient{}
+	if store == nil {
+		return out
+	}
+	links, err := store.ListVlessLinks()
+	if err != nil {
+		logger.Warn("could not read the REALITY client links", "error", err)
+		return out
+	}
+	secret, err := store.EnsureVlessLinkSecret()
+	if err != nil {
+		logger.Warn("could not read the link secret", "error", err)
+		return out
+	}
+
+	clients, err := store.ListVlessClients()
+	if err != nil {
+		logger.Warn("could not read the managed VLESS clients", "error", err)
+		return out
+	}
+	byID := map[int64]VlessClient{}
+	for _, c := range clients {
+		byID[c.ID] = c
+	}
+
+	for clientID, username := range links {
+		client, ok := byID[clientID]
+		if !ok || !client.Enabled {
+			continue
+		}
+		_, password := VlessLinkCredentials(secret, clientID)
+		out[client.UUID] = realityLinkedClient{
+			ID:       clientID,
+			Username: username,
+			Password: password,
+		}
+	}
+	return out
 }
 
 // adoptLegacyClientIDs moves an id list from the old comma-joined config value
@@ -1010,6 +1103,7 @@ func (s *ProxyServer) applyVlessClients() error {
 	}
 	s.realityMu.Lock()
 	keys.ClientIDs, err = s.store.EnabledVlessClientUUIDs()
+	keys.Links = loadRealityLinks(s.store, s.logger)
 	s.realityMu.Unlock()
 	if err != nil {
 		return err
@@ -1118,4 +1212,61 @@ func runRealityClient(args []string) error {
 	cmd := exec.Command(orDefault(*bin, "xray"), "run", "-c", cfgPath)
 	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
 	return cmd.Run()
+}
+
+// linkVlessClient bills a REALITY client's traffic to a SOCKS user of its own,
+// or stops doing so.
+//
+// The username and password xray needs are derived from this install's link
+// secret rather than stored: only the hash goes into the users table, the
+// plaintext is recomputed on every render, and nothing readable is ever kept.
+func (s *ProxyServer) linkVlessClient(clientID int64, link bool, tier *string) error {
+	if !link {
+		if err := s.store.UnlinkVlessClient(clientID); err != nil {
+			return err
+		}
+	} else {
+		secret, err := s.store.EnsureVlessLinkSecret()
+		if err != nil {
+			return err
+		}
+		derived, password := VlessLinkCredentials(secret, clientID)
+
+		// An existing user keeps its own tier; a new one is created at the tier
+		// asked for, defaulting to the shared credentials' behaviour.
+		existing, err := s.store.GetUser(derived)
+		switch {
+		case err == nil && existing != nil:
+			// Already created on a previous link.
+		case s.store != nil && tier != nil && *tier != "":
+			if _, err := s.store.CreateUser(derived, password, *tier); err != nil {
+				return err
+			}
+		default:
+			if _, err := s.store.CreateUser(derived, password, defaultLinkedUserTier); err != nil {
+				return err
+			}
+		}
+		if err := s.store.LinkVlessClient(clientID, derived); err != nil {
+			return err
+		}
+		s.logger.Info("reality client linked to a socks user",
+			"client", clientID, "username", derived, "tier", tierName(tier))
+	}
+
+	// Put it in front of xray straight away, the same as any other client change.
+	return s.applyVlessClients()
+}
+
+// defaultLinkedUserTier is what a linked client gets when no tier is named: the
+// service's own credentials, so linking does not quietly change what someone
+// gets until an operator says so.
+const defaultLinkedUserTier = "unlimited"
+
+// tierName names the tier for a log line, without dereferencing a nil pointer.
+func tierName(tier *string) string {
+	if tier == nil || *tier == "" {
+		return defaultLinkedUserTier
+	}
+	return *tier
 }

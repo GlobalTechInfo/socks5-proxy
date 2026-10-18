@@ -579,3 +579,174 @@ func TestRealityEndToEnd(t *testing.T) {
 		t.Error("the REALITY session never reached the SOCKS5 pipeline")
 	}
 }
+
+// A linked REALITY client must have its traffic billed to the SOCKS user it was
+// linked to. Without this, xray forwards everything through the shared
+// credentials and every REALITY session is unmetered no matter what the account
+// is on.
+func TestRealityLinkedClientIsBilledToItsUser(t *testing.T) {
+	bin := requireXray(t)
+	store := newTestStore(t)
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, "linked-ok")
+	}))
+	defer origin.Close()
+
+	proxyCfg := DefaultConfig()
+	proxyCfg.AuthEnabled = true
+	proxyCfg.AdminEnabled = false
+	proxyCfg.SecurityHeadersEnabled = false
+	proxyCfg.RateLimitEnabled = false
+	proxyCfg.Username = "shared"
+	proxyCfg.Password = "sharedpass"
+	proxyCfg.ProxyPort = freePort(t)
+
+	server := NewProxyServer(proxyCfg)
+	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", proxyCfg.ProxyPort))
+	if err != nil {
+		t.Fatalf("listen socks: %v", err)
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			conn, aerr := ln.Accept()
+			if aerr != nil {
+				return
+			}
+			go server.handleClient(conn, "")
+		}
+	}()
+	server.store = store
+
+	cfg := proxyCfg
+	cfg.RealityXrayBin = bin
+	cfg.RealityEnabled = true
+	cfg.RealityBind = fmt.Sprintf("127.0.0.1:%d", freePort(t))
+	cfg.RealityPublicHost = "127.0.0.1"
+
+	client, err := store.CreateVlessClient("0cd94710-7290-40da-857d-5f5a7670cd62", "linked phone")
+	if err != nil {
+		t.Fatalf("create vless client: %v", err)
+	}
+
+	keys, err := resolveRealityKeys(cfg, nil, store, log)
+	if err != nil {
+		t.Fatalf("resolve keys: %v", err)
+	}
+	runner, err := startReality(cfg, keys, log)
+	if err != nil {
+		t.Fatalf("start reality: %v", err)
+	}
+	defer runner.Stop()
+	server.reality, server.realityKeys = runner, keys
+
+	// Link it to a user of its own, at a tier that is easy to spot in the data.
+	free := "free"
+	if err := server.linkVlessClient(client.ID, true, &free); err != nil {
+		t.Fatalf("link: %v", err)
+	}
+
+	linked, err := store.ListVlessLinks()
+	if err != nil || linked[client.ID] == "" {
+		t.Fatalf("the link was not recorded: %v, %v", linked, err)
+	}
+	username := linked[client.ID]
+
+	// The linked user must exist as an ordinary SOCKS user, on the tier asked
+	// for, with a password only this install can reproduce.
+	user, err := store.GetUser(username)
+	if err != nil {
+		t.Fatalf("the linked user does not exist: %v", err)
+	}
+	if user.Tier != free {
+		t.Errorf("linked user tier = %q, want %q", user.Tier, free)
+	}
+	secret, err := store.EnsureVlessLinkSecret()
+	if err != nil {
+		t.Fatalf("link secret: %v", err)
+	}
+	_, password := VlessLinkCredentials(secret, client.ID)
+	if ok, _ := VerifyPassword(user.PasswordHash, password); !ok {
+		t.Error("the derived password does not verify against the stored hash")
+	}
+
+	// And the rendered config must route that client's email to its own outbound.
+	server.realityMu.Lock()
+	reloaded := server.realityKeys
+	server.realityMu.Unlock()
+	rendered, err := renderRealityServerConfig(cfg, reloaded)
+	if err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	var parsed struct {
+		Inbounds []struct {
+			Settings struct {
+				Clients []struct{ ID, Email string }
+			} `json:"settings"`
+		} `json:"inbounds"`
+		Outbounds []struct{ Tag, Protocol string } `json:"outbounds"`
+		Routing   struct {
+			Rules []struct {
+				User        []string `json:"user"`
+				OutboundTag string   `json:"outboundTag"`
+			} `json:"rules"`
+		} `json:"routing"`
+	}
+	if err := json.Unmarshal(rendered, &parsed); err != nil {
+		t.Fatalf("unmarshal config: %v", err)
+	}
+
+	email := vlessClientEmail(client.ID)
+	if got := parsed.Inbounds[0].Settings.Clients[0].Email; got != email {
+		t.Errorf("client email = %q, want %q", got, email)
+	}
+	tag := vlessOutboundTag(client.ID)
+	found := false
+	for _, o := range parsed.Outbounds {
+		if o.Tag == tag && o.Protocol == "socks" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("no per-user socks outbound %q in the config", tag)
+	}
+	routed := false
+	for _, r := range parsed.Routing.Rules {
+		for _, u := range r.User {
+			if u == email && r.OutboundTag == tag {
+				routed = true
+			}
+		}
+	}
+	if !routed {
+		t.Errorf("no rule routes %q to %q", email, tag)
+	}
+
+	// The config xray is actually running must accept all of it.
+	if _, err := runXray(bin, "run", "-c", mustWriteConfig(t, rendered), "--test"); err != nil {
+		t.Errorf("xray rejected the linked-client config: %v", err)
+	}
+
+	// Unlinking puts it back on the shared credentials.
+	if err := server.linkVlessClient(client.ID, false, nil); err != nil {
+		t.Fatalf("unlink: %v", err)
+	}
+	after, err := store.ListVlessLinks()
+	if err != nil {
+		t.Fatalf("links after unlink: %v", err)
+	}
+	if _, still := after[client.ID]; still {
+		t.Error("the client is still linked after being unlinked")
+	}
+}
+
+func mustWriteConfig(t *testing.T, data []byte) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "xray.json")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	return path
+}

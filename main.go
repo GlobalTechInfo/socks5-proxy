@@ -1859,6 +1859,14 @@ func (s *ProxyServer) adminHandler() http.Handler {
 			s.realityMu.Lock()
 			enabled := s.reality != nil
 			s.realityMu.Unlock()
+			if links, lerr := s.store.ListVlessLinks(); lerr == nil && len(links) > 0 {
+				for i := range clients {
+					if name, ok := links[clients[i].ID]; ok {
+						linked := name
+						clients[i].Linked = linked
+					}
+				}
+			}
 			s.configMu.RLock()
 			pinned := len(s.cfg.RealityClientIDs) > 0
 			s.configMu.RUnlock()
@@ -1960,10 +1968,27 @@ func (s *ProxyServer) adminHandler() http.Handler {
 			var req struct {
 				Label   *string `json:"label"`
 				Enabled *bool   `json:"enabled"`
+				// Link bills this client's traffic to a SOCKS user of its own, so
+				// its tier, limits and accounting apply. False unlinks.
+				Link *bool   `json:"link"`
+				Tier *string `json:"tier"`
 			}
 			if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req); err != nil {
 				http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
 				return
+			}
+			if req.Link != nil {
+				if err := s.linkVlessClient(id, *req.Link, req.Tier); err != nil {
+					http.Error(w, "link failed: "+err.Error(), http.StatusBadRequest)
+					return
+				}
+				if *req.Link {
+					if links, lerr := s.store.ListVlessLinks(); lerr == nil {
+						if name, ok := links[id]; ok {
+							w.Header().Set("X-Linked-User", name)
+						}
+					}
+				}
 			}
 			if err := s.store.UpdateVlessClient(id, req.Label, req.Enabled); err != nil {
 				http.Error(w, "update failed: "+err.Error(), http.StatusInternalServerError)
