@@ -30,7 +30,7 @@ func TestFakeTLSHandshakeWithGotdClient(t *testing.T) {
 	defer client.Close()
 	defer server.Close()
 
-	secrets := mtprotoSecrets{secret: key}
+	secrets := grantsOf(t, secret, key)
 	done := make(chan error, 1)
 	go func() {
 		_, info, herr := fakeTLSHandshake(server, secrets, time.Now(), "www.cloudflare.com")
@@ -69,7 +69,7 @@ func TestFakeTLSCarriesAPayloadBothWays(t *testing.T) {
 
 	serverSide := make(chan *fakeTLSRecordConn, 1)
 	go func() {
-		wrapped, _, err := fakeTLSHandshake(server, mtprotoSecrets{secret: key}, time.Now(), "www.cloudflare.com")
+		wrapped, _, err := fakeTLSHandshake(server, grantsOf(t, secret, key), time.Now(), "www.cloudflare.com")
 		if err != nil {
 			serverSide <- nil
 			return
@@ -133,7 +133,7 @@ func TestFakeTLSRefusesWrongSecret(t *testing.T) {
 	client.SetDeadline(time.Now().Add(5 * time.Second))
 
 	go func() {
-		_, _, _ = fakeTLSHandshake(server, mtprotoSecrets{secret: key}, time.Now(), "www.cloudflare.com")
+		_, _, _ = fakeTLSHandshake(server, grantsOf(t, secret, key), time.Now(), "www.cloudflare.com")
 	}()
 
 	clientObf := faketls.NewFakeTLS(rand.Reader, client)
@@ -160,7 +160,7 @@ func TestFakeTLSRefusesAStaleHello(t *testing.T) {
 	// A server a day ahead of the client treats a fresh hello as stale.
 	future := time.Now().Add(24 * time.Hour)
 	go func() {
-		_, _, _ = fakeTLSHandshake(server, mtprotoSecrets{secret: key}, future, "www.cloudflare.com")
+		_, _, _ = fakeTLSHandshake(server, grantsOf(t, secret, key), future, "www.cloudflare.com")
 	}()
 
 	clientObf := faketls.NewFakeTLS(rand.Reader, client)
@@ -179,7 +179,7 @@ func TestFakeTLSHelloDomainParsing(t *testing.T) {
 	defer client.Close()
 	defer server.Close()
 
-	secrets := mtprotoSecrets{secret: key}
+	secrets := grantsOf(t, secret, key)
 	domains := make(chan string, 1)
 	go func() {
 		_, info, err := fakeTLSHandshake(server, secrets, time.Now(), "www.cloudflare.com")
@@ -262,7 +262,7 @@ func TestFakeTLSThroughTheListener(t *testing.T) {
 
 	s := NewProxyServer(cfg)
 	s.store = newTestStore(t)
-	if _, err := s.store.CreateMtprotoSecret(secret, "ee phone"); err != nil {
+	if _, err := s.store.CreateMtprotoSecret(secret, "ee phone", "unlimited"); err != nil {
 		t.Fatalf("store secret: %v", err)
 	}
 	if err := s.startMTProto(nil); err != nil {
@@ -301,4 +301,10 @@ func TestFakeTLSThroughTheListener(t *testing.T) {
 	if !bytes.Equal(echoed, payload) {
 		t.Errorf("echoed %q, want %q", echoed, payload)
 	}
+}
+
+// grantsOf builds a one-entry grant set for a secret and its plan.
+func grantsOf(t *testing.T, secret string, key []byte) mtprotoGrants {
+	t.Helper()
+	return mtprotoGrants{secret: mtprotoGrant{key: key, tier: Tiers[defaultMtprotoTier]}}
 }

@@ -125,7 +125,7 @@ type fakeTLSClientHello struct {
 //
 // secrets is tried in turn: the client's random is the HMAC of its own hello
 // under the secret it was given, so only the right key produces a match.
-func fakeTLSHandshake(conn net.Conn, secrets mtprotoSecrets, now time.Time, cloakHost string) (*fakeTLSRecordConn, *fakeTLSClientHello, error) {
+func fakeTLSHandshake(conn net.Conn, secrets mtprotoGrants, now time.Time, cloakHost string) (*fakeTLSRecordConn, *fakeTLSClientHello, error) {
 	record, raw, err := readFakeTLSRecordRaw(conn)
 	if err != nil {
 		return nil, nil, fmt.Errorf("read fake tls hello: %w", err)
@@ -162,7 +162,7 @@ func fakeTLSHandshake(conn net.Conn, secrets mtprotoSecrets, now time.Time, cloa
 // fakeTLSMatchSecret finds the secret a hello was made with. The random is an
 // HMAC over the hello with itself zeroed, so a mismatch is simply "no match" --
 // there is nothing to give up on, and nothing leaks beyond the timing.
-func fakeTLSMatchSecret(raw []byte, secrets mtprotoSecrets, now time.Time) ([]byte, error) {
+func fakeTLSMatchSecret(raw []byte, secrets mtprotoGrants, now time.Time) ([]byte, error) {
 	const randomAt = fakeTLSServerRandomOffset
 	if len(raw) < randomAt+32 {
 		return nil, fmt.Errorf("ClientHello is %d bytes, too short to carry a random", len(raw))
@@ -174,11 +174,11 @@ func fakeTLSMatchSecret(raw []byte, secrets mtprotoSecrets, now time.Time) ([]by
 	original := append([]byte(nil), raw[randomAt:randomAt+32]...)
 	defer copy(raw[randomAt:randomAt+32], original)
 
-	for _, secret := range secrets {
+	for _, grant := range secrets {
 		for i := randomAt; i < randomAt+32; i++ {
 			raw[i] = 0
 		}
-		mac := hmac.New(sha256.New, secret)
+		mac := hmac.New(sha256.New, grant.key)
 		mac.Write(raw)
 		want := mac.Sum(nil)
 
@@ -191,7 +191,7 @@ func fakeTLSMatchSecret(raw []byte, secrets mtprotoSecrets, now time.Time) ([]by
 		if skew := now.Sub(time.Unix(int64(got), 0)); skew > fakeTLSTimeSkew || skew < -fakeTLSTimeSkew {
 			continue
 		}
-		return secret, nil
+		return grant.key, nil
 	}
 	return nil, errors.New("no configured secret matched this fake TLS hello")
 }
