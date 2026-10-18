@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -1175,6 +1176,49 @@ func basicAuth(user, pass string) func(http.Handler) http.Handler {
 	}
 }
 
+// sameOriginOnly refuses state-changing requests that a page on another site
+// could have caused.
+//
+// The admin API is authenticated with HTTP Basic, and browsers attach Basic
+// credentials to any request for that origin regardless of which page started
+// it. That makes every mutating route here a target: a form on any website can
+// reset a user's data usage or revoke a VLESS UUID, and the browser will
+// cheerfully attach the admin's credentials on the way.
+//
+// The test is the one the browser makes easy. Origin is sent on every cross-site
+// state-changing request, and on same-origin ones, so a mutating request that
+// arrives with no Origin at all did not come from a browser page and is left
+// alone -- that keeps curl and the API working. Sec-Fetch-Site, which modern
+// browsers send on every request, is the belt to that pair of braces.
+func sameOriginOnly(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet, http.MethodHead, http.MethodOptions:
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		// Sec-Fetch-Site is the coarse signal: it names a different site, not a
+		// different origin, so it is only trusted to rule requests out. The
+		// Origin check below is what actually decides, and a request from
+		// another subdomain is settled there rather than here.
+		if site := r.Header.Get("Sec-Fetch-Site"); site == "cross-site" {
+			http.Error(w, "cross-site request refused", http.StatusForbidden)
+			return
+		}
+
+		if origin := r.Header.Get("Origin"); origin != "" {
+			u, err := url.Parse(origin)
+			if err != nil || u.Host == "" || !strings.EqualFold(u.Host, r.Host) {
+				http.Error(w, "cross-site request refused", http.StatusForbidden)
+				return
+			}
+		}
+
+		next.ServeHTTP(w, r)
+	})
+}
+
 // ─── Rate Limiter ──────────────────────────────────────────────────────────
 
 type rateLimiter struct {
@@ -2069,6 +2113,7 @@ func (s *ProxyServer) adminHandler() http.Handler {
 		s.limiter = newRateLimiterSet(s.cfg.RateLimitRPS)
 		handler = rateLimit(s.limiter)(handler)
 	}
+	handler = sameOriginOnly(handler)
 	if s.cfg.AdminEnabled && s.cfg.AdminUser != "" && s.cfg.AdminPass != "" {
 		handler = basicAuth(s.cfg.AdminUser, s.cfg.AdminPass)(handler)
 	}
