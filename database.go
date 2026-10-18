@@ -1,7 +1,9 @@
 package main
 
 import (
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
 	"fmt"
@@ -132,6 +134,15 @@ func (s *Store) migrate() error {
 			enabled INTEGER NOT NULL DEFAULT 1,
 			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 		)`,
+		// The SOCKS user a REALITY client's traffic is billed to. Empty means the
+		// client falls back to the shared credentials, which is how every client
+		// behaved before this existed.
+		`CREATE TABLE IF NOT EXISTS vless_links (
+			client_id INTEGER PRIMARY KEY,
+			username TEXT NOT NULL,
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+			FOREIGN KEY (client_id) REFERENCES vless_clients(id) ON DELETE CASCADE
+		)`,
 		// MTProto secrets for the Telegram front door. The stored value is the
 		// shareable form, dd followed by 32 hex characters, so it can be pasted
 		// into a phone without editing.
@@ -161,6 +172,92 @@ func (s *Store) migrate() error {
 		return fmt.Errorf("add mtproto tier column: %w", err)
 	}
 	return nil
+}
+
+// ─── REALITY client links ───────────────────────────────────────────────────
+
+const dbVlessLinkSecret = "vless_link_secret"
+
+// EnsureVlessLinkSecret returns this install's link secret, generating it the
+// first time it is asked for.
+//
+// It exists so a REALITY client's proxy password can be put in an xray config
+// without storing a readable password anywhere: the value is derived from this
+// secret, and only its hash is kept in the users table.
+func (s *Store) EnsureVlessLinkSecret() ([]byte, error) {
+	if saved := s.LoadConfig()[dbVlessLinkSecret]; saved != "" {
+		if secret, err := hex.DecodeString(saved); err == nil && len(secret) == 32 {
+			return secret, nil
+		}
+	}
+
+	secret := make([]byte, 32)
+	if _, err := rand.Read(secret); err != nil {
+		return nil, err
+	}
+	if err := s.SaveConfig(dbVlessLinkSecret, hex.EncodeToString(secret)); err != nil {
+		return nil, err
+	}
+	return secret, nil
+}
+
+// VlessLinkCredentials derives the SOCKS username and password for a linked
+// REALITY client. Both are a function of this install's link secret and the
+// client id, so xray's config can carry them and the database can keep only the
+// password's hash.
+func VlessLinkCredentials(secret []byte, clientID int64) (username, password string) {
+	mac := hmac.New(sha256.New, secret)
+	fmt.Fprintf(mac, "vless:%d", clientID)
+	return fmt.Sprintf("xr%d", clientID), hex.EncodeToString(mac.Sum(nil))
+}
+
+// VlessLink says which SOCKS user a REALITY client's traffic belongs to.
+type VlessLink struct {
+	ClientID int64  `json:"client_id"`
+	Username string `json:"username"`
+}
+
+func (s *Store) LinkVlessClient(clientID int64, username string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	_, err := s.db.Exec(
+		`INSERT INTO vless_links (client_id, username) VALUES (?, ?)
+		 ON CONFLICT(client_id) DO UPDATE SET username=excluded.username`,
+		clientID, username)
+	return err
+}
+
+func (s *Store) UnlinkVlessClient(clientID int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	_, err := s.db.Exec("DELETE FROM vless_links WHERE client_id=?", clientID)
+	return err
+}
+
+// ListVlessLinks is keyed by client id, so the renderer can look a client up
+// without scanning.
+func (s *Store) ListVlessLinks() (map[int64]string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	rows, err := s.db.Query("SELECT client_id, username FROM vless_links")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := map[int64]string{}
+	for rows.Next() {
+		var id int64
+		var username string
+		if err := rows.Scan(&id, &username); err != nil {
+			return nil, err
+		}
+		out[id] = username
+	}
+	return out, rows.Err()
 }
 
 // ─── Config persistence ────────────────────────────────────────────────────
@@ -530,7 +627,7 @@ func (s *Store) ListUsers() ([]User, error) {
 	}
 	defer rows.Close()
 
-	var users []User
+	users := []User{}
 	for rows.Next() {
 		var u User
 		var enabled int
@@ -643,6 +740,9 @@ type VlessClient struct {
 	Label     string `json:"label"`
 	Enabled   bool   `json:"enabled"`
 	CreatedAt string `json:"created_at"`
+	// Linked is the SOCKS user this client's traffic is billed to, empty when
+	// it falls through on the shared credentials.
+	Linked string `json:"linked,omitempty"`
 }
 
 // IsUUID reports whether s looks like a UUID xray would accept. Deliberately

@@ -797,13 +797,19 @@ async function loadVlessClients(){
       row.appendChild(status);
       var actions=el('td');
       actions.className='actions';
+      var bill=el('button',c.linked?'Metered':'Meter it');
+      bill.className='btn btn-sm '+(c.linked?'btn-success':'');
+      bill.title=c.linked
+        ? 'Billed to the SOCKS user '+c.linked+' — click to stop'
+        : 'Bill this client to a SOCKS user of its own, so its tier and limits apply';
+      bill.onclick=function(){setVlessLink(c.id,!c.linked)};
       var toggle=el('button',c.enabled?'Disable':'Enable');
       toggle.className='btn btn-sm '+(c.enabled?'btn-danger':'btn-success');
       toggle.onclick=function(){toggleVlessClient(c.id,!c.enabled)};
       var del=el('button','Del');
       del.className='btn btn-sm btn-danger';
       del.onclick=function(){deleteVlessClient(c.id,c.label||c.uuid)};
-      actions.appendChild(toggle);actions.appendChild(del);
+      actions.appendChild(bill);actions.appendChild(toggle);actions.appendChild(del);
       row.appendChild(actions);
       tbody.appendChild(row);
     }
@@ -829,6 +835,23 @@ async function createVlessClient(){
       msg.className='msg msg-err';msg.style.display='block';
     }
   }catch(e){msg.textContent='Network error: '+e.message;msg.className='msg msg-err';msg.style.display='block'}
+}
+
+// Billing a REALITY client to a SOCKS user of its own is what makes its tier
+// apply: otherwise every session arrives on the shared credentials.
+async function setVlessLink(id,link){
+  var msg=document.getElementById('vless-msg');
+  var body=link?{link:true,tier:'unlimited'}:{link:false};
+  try{
+    var r=await fetch('/api/vless-clients/'+id,{method:'PUT',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    if(!r.ok){msg.textContent='Error: '+(await r.text());msg.className='msg msg-err';msg.style.display='block'}
+    else if(link){
+      var name=r.headers.get('X-Linked-User');
+      msg.textContent='Now billed to the SOCKS user '+(name||'it created')+'. Set that user\'s tier to meter it.';
+      msg.className='msg msg-ok';msg.style.display='block';
+    }else{msg.style.display='none'}
+  }catch(e){msg.textContent='Network error: '+e.message;msg.className='msg msg-err';msg.style.display='block'}
+  loadVlessClients();
 }
 
 async function toggleVlessClient(id,enabled){
